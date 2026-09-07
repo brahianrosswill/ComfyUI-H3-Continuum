@@ -1,22 +1,36 @@
-ComfyUI-H3-Continuum 3.2.1 — インストール
+ComfyUI-H3-Continuum V3.8 — インストール
 
 1. ComfyUIを終了します。
-2. ZIPを展開します。
-3. `ComfyUI-H3-Continuum` フォルダーを ComfyUI/custom_nodes/ に配置します。
-4. 旧 `ComfyUI-H3-Continuum-Join` が残っている場合は退避します。
-5. ComfyUIを再起動します。
-6. 旧UIが残る場合はブラウザをハードリロードします。
+2. 既存の `ComfyUI-H3-Continuum` を更新する場合は、作業中のworkflowとRun Storageを先に退避します。
+3. ZIPを展開し、`ComfyUI-H3-Continuum` フォルダーを `ComfyUI/custom_nodes/` に配置します。
+4. ComfyUIを再起動します。旧UIが残る場合はブラウザをハードリロードします。
 
-StabilityMatrix標準例:
-D:\StabilityMatrix\Data\Packages\ComfyUI_W\custom_nodes\ComfyUI-H3-Continuum\
+StabilityMatrixの配置例:
+`D:\StabilityMatrix\Data\Packages\ComfyUI_W\custom_nodes\ComfyUI-H3-Continuum\`
 
-自動インストール:
-install_windows.bat
+PowerShellによる自動インストール:
+`install_windows.ps1`
 
-標準検証:
+V3.8の公開ノードは7個です。
+
+- H3 Continuum Sampler V3.8
+- H3 Continuum Reference Audios
+- H3 Continuum Finalize
+- H3 Continuum Load Image
+- H3 Continuum Load Audio
+- H3 Continuum Load Video
+- H3 Continuum Second Pass
+
+標準の入出力経路は、Sampler V3.8 → ComfyUI Core Video / Audio Decode → Finalize → Core Create Video → Core Save Videoです。Hi-Res Fixは標準経路に含みません。サイズは `Size Source = First Image`（初期画像がある場合）または `Manual`（Width / Heightを入力）で指定します。
+
+配布Workflowは `examples/workflows/MiniMax_H3_Continuum_V38.json` と同じJSONを含む同名ZIPです。このZIPはWorkflowだけを格納しており、手順3のカスタムノード本体ZIPとは別物です。Spectrum初期設定のgraphをそのまま配布するため、Spectrum、rgthree、KJNodes、ComfyUI-Easy-Useを別途導入してください。Turboへ切り替えてもこれらのノードはgraphに残ります。モデルや画像・音声は含みません。保存済みファイル名は各自の入力へ置き換え、不要な入力はOFFにしてください。
+
+最小確認:
 - chunks: 2 または 3
 - chunk_seconds: 5.0
 - continuity: Balanced — 22 frames
-- Audio Seam: Off（標準）/ Auto（音声境界補正を試す場合）
 - Sequence Prompt: Text (Multiline)を接続
-- 最終Video/Audio VAE DecodeはComfyUI Coreノードへ接続
+- 最終Video/Audio VAE Decodeと保存はComfyUI Coreノードへ接続
+- Reference Audioを複数使う場合は `H3 Continuum Reference Audios` helperへ最大3本を接続
+
+同一機能の旧フォルダーや旧Manager導入版を重複配置しないでください。V3.7以前のNode IDを使う保存workflowは、その対応Release/tagで開いてください。

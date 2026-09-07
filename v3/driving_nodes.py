@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import torch
 
-from ..constants import CONTINUITY_OPTIONS, FPS
+from ..branch_provenance import (
+    TAKE_ACTION_AUTOMATIC,
+    TAKE_ACTION_OPTIONS,
+)
+from ..constants import (
+    CONTINUITY_OPTIONS,
+    DIAGNOSTICS_FULL,
+    DIAGNOSTICS_OFF,
+    FPS,
+    normalize_diagnostics_mode,
+)
 from ..driving_audio import prepare_driving_audio_source
 from ..guide_timeline import (
     GUIDE_TYPE,
@@ -15,6 +25,10 @@ from ..hardening import diagnostics_is_full
 from ..reference_video import (
     REFERENCE_VIDEO_SIZE_EFFICIENT,
     REFERENCE_VIDEO_SIZE_OPTIONS,
+)
+from ..reference_audio import (
+    H3ContinuumReferenceAudios,
+    REFERENCE_AUDIOS_TYPE,
 )
 from ..v2.decoder import enforce_total_frames
 from .assembly import (
@@ -31,7 +45,40 @@ from .memory_attribution import (
     format_assembly_projection,
     project_assembly_buffers,
 )
+from .memory_action_policy import (
+    ACTION_DISABLED,
+    ACTION_OPTIONS,
+    MEMORY_ACTION_POLICY_TYPE,
+    format_memory_action_status,
+    make_memory_action_policy,
+    resolve_memory_action_policy,
+)
 from .nodes import CATEGORY as CONTINUUM_CATEGORY, H3ContinuumSamplerProduction
+from .resolution import (
+    H3_ASPECT_AUTO,
+    H3_ASPECT_OPTIONS,
+    H3_CANVAS_MAX,
+    H3_CANVAS_MIN,
+    H3_CANVAS_MULTIPLE,
+    H3_CUSTOM_MP_DEFAULT,
+    H3_CUSTOM_MP_MAX,
+    H3_CUSTOM_MP_MIN,
+    H3_MANUAL_HEIGHT_DEFAULT,
+    H3_MANUAL_WIDTH_DEFAULT,
+    H3_PRESET_DRAFT,
+    H3_PRESET_OPTIONS,
+    H3_SIZE_SOURCE_LEGACY,
+    H3_SIZE_SOURCE_OPTIONS,
+    resolve_h3_size_source,
+)
+from .reliability_v38 import append_v38_status, build_v38_diagnostics
+from .review_control import (
+    GENERATION_MODE_FULL_RUN,
+    GENERATION_MODE_OPTIONS,
+    GENERATION_MODE_REVIEW,
+    REVIEW_ACTION_CONTINUE,
+    REVIEW_ACTION_OPTIONS,
+)
 
 
 _DRIVING_AUDIO_PLAN_KEY = "_h3_continuum_driving_audio_v1"
@@ -462,6 +509,406 @@ class H3ContinuumSamplerV37(H3ContinuumSamplerV36):
         return super().run(guide_source=guide_source, **kwargs)
 
 
+class H3ContinuumSamplerV38(H3ContinuumSamplerV37):
+    """V3.7 Production facade with the shared H3 resolution preset UI."""
+
+    DEPRECATED = False
+    CATEGORY = CONTINUUM_CATEGORY
+    DESCRIPTION = (
+        "H3 Continuum V3.8 facade over the unchanged V3.7 Production engine. "
+        "Size Source and preset resolve to the existing width/height runtime contract; "
+        "post-generation reliability diagnostics inspect frame/audio grids, Core "
+        "compatibility, and relative visual conditioning load without changing tensors."
+    )
+    SEARCH_ALIASES = [
+        "H3 Continuum Sampler V3.8",
+        "MiniMax H3 resolution preset",
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        resolved_required = {}
+        for name, definition in schema.get("required", {}).items():
+            if name == "width":
+                resolved_required["aspect"] = (
+                    H3_ASPECT_OPTIONS,
+                    {
+                        "default": H3_ASPECT_AUTO,
+                        "display_name": "Legacy Aspect",
+                        "advanced": True,
+                        "tooltip": (
+                            "Saved V3.8 workflow compatibility only. The frontend migrates "
+                            "this value to Size Source and hides it from the Main UI."
+                        ),
+                    },
+                )
+                resolved_required["preset"] = (
+                    H3_PRESET_OPTIONS,
+                    {
+                        "default": H3_PRESET_DRAFT,
+                        "display_name": "Resolution Preset",
+                        "tooltip": (
+                            "Used only with Size Source = First Image. Draft is fastest; "
+                            "Balanced retains more detail; Native 768 uses the H3 native "
+                            "short edge; Custom uses Custom MP."
+                        ),
+                    },
+                )
+                resolved_required["custom_mp"] = (
+                    "FLOAT",
+                    {
+                        "default": H3_CUSTOM_MP_DEFAULT,
+                        "min": H3_CUSTOM_MP_MIN,
+                        "max": H3_CUSTOM_MP_MAX,
+                        "step": 0.01,
+                        "display_name": "Custom MP",
+                        "tooltip": (
+                            "Custom target megapixels while preserving the connected First "
+                            "Image aspect ratio. Used only when Resolution Preset is Custom."
+                        ),
+                    },
+                )
+                continue
+            if name == "height":
+                continue
+            resolved_required[name] = definition
+        # Keep every existing V3.8 widget index stable. Review controls are
+        # intentionally appended instead of being inserted near Run Storage.
+        resolved_required["generation_mode"] = (
+            GENERATION_MODE_OPTIONS,
+            {
+                "default": GENERATION_MODE_FULL_RUN,
+                "display_name": "Generation Mode",
+                "tooltip": (
+                    "Full Run preserves normal Production execution. Review Each "
+                    "Chunk generates at most one new physical group per Queue and "
+                    "requires Run Storage = Save + Auto Resume."
+                ),
+            },
+        )
+        resolved_required["review_action"] = (
+            REVIEW_ACTION_OPTIONS,
+            {
+                "default": REVIEW_ACTION_CONTINUE,
+                "display_name": "Review Action",
+                "tooltip": (
+                    "Continue / Next accepts the current review and advances. "
+                    "Regenerate Current and Finish Remaining are one-shot actions. "
+                    "Smart Regenerate requires Regenerate From = Auto."
+                ),
+            },
+        )
+        resolved_required["take_group"] = (
+            "INT",
+            {
+                "default": 0,
+                "min": 0,
+                "max": 16,
+                "step": 1,
+                "advanced": True,
+                "display_name": "Selected Take Group",
+                "tooltip": (
+                    "Internal Render History selection. Use the visible Previous/Next Take "
+                    "controls instead of editing this value directly."
+                ),
+            },
+        )
+        resolved_required["take_revision_id"] = (
+            "STRING",
+            {
+                "default": "",
+                "advanced": True,
+                "display_name": "Selected Take Revision",
+                "tooltip": (
+                    "Immutable revision selected by Render History. The visible Take controls "
+                    "manage this value from verified Run Storage data."
+                ),
+            },
+        )
+        resolved_required["take_action"] = (
+            TAKE_ACTION_OPTIONS,
+            {
+                "default": TAKE_ACTION_AUTOMATIC,
+                "advanced": True,
+                "display_name": "Take Action",
+                "tooltip": (
+                    "One-shot Render History action. Selecting a Take alone does not change "
+                    "the canonical branch; Queue normally after choosing an action."
+                ),
+            },
+        )
+        resolved_required["size_source"] = (
+            H3_SIZE_SOURCE_OPTIONS,
+            {
+                "default": H3_SIZE_SOURCE_LEGACY,
+                "display_name": "Size Source",
+                "tooltip": (
+                    "First Image preserves its aspect at the selected Resolution Preset. "
+                    "Manual uses Width and Height exactly. Legacy Aspect is accepted only "
+                    "for saved-workflow and API compatibility."
+                ),
+            },
+        )
+        resolved_required["width"] = (
+            "INT",
+            {
+                "default": H3_MANUAL_WIDTH_DEFAULT,
+                "min": H3_CANVAS_MIN,
+                "max": H3_CANVAS_MAX,
+                "step": H3_CANVAS_MULTIPLE,
+                "display_name": "Width",
+                "tooltip": (
+                    "Exact output width in Manual mode. Use a multiple of 32. Manual mode is "
+                    "the normal choice for T2VA or workflows without a First Image."
+                ),
+            },
+        )
+        resolved_required["height"] = (
+            "INT",
+            {
+                "default": H3_MANUAL_HEIGHT_DEFAULT,
+                "min": H3_CANVAS_MIN,
+                "max": H3_CANVAS_MAX,
+                "step": H3_CANVAS_MULTIPLE,
+                "display_name": "Height",
+                "tooltip": (
+                    "Exact output height in Manual mode. Use a multiple of 32. Manual mode is "
+                    "the normal choice for T2VA or workflows without a First Image."
+                ),
+            },
+        )
+        schema["required"] = resolved_required
+        optional = dict(schema.get("optional", {}))
+        optional["audio_references"] = (
+            REFERENCE_AUDIOS_TYPE,
+            {
+                "display_name": "Audio References (Optional)",
+                "tooltip": (
+                    "Optional ordered bundle from H3 Continuum Reference Audios. "
+                    "Do not connect it together with the legacy single Reference Audio input."
+                ),
+            },
+        )
+        schema["optional"] = optional
+        return schema
+
+    @classmethod
+    def IS_CHANGED(
+        cls,
+        generation_mode=GENERATION_MODE_FULL_RUN,
+        **kwargs,
+    ):
+        # Review execution depends on validated Run Storage state that is
+        # intentionally outside the visible graph inputs.  Always execute the
+        # V3.8 sampler in Review mode and let Run Storage remain the sole
+        # authority for exact prefix reuse.  Full Run keeps Core's stable cache
+        # behavior, and this method is deliberately not inherited by V3.7/Easy.
+        if generation_mode == GENERATION_MODE_REVIEW:
+            return float("NaN")
+        return False
+
+    def run(
+        self,
+        aspect=H3_ASPECT_AUTO,
+        preset=H3_PRESET_DRAFT,
+        custom_mp=H3_CUSTOM_MP_DEFAULT,
+        generation_mode=GENERATION_MODE_FULL_RUN,
+        review_action=REVIEW_ACTION_CONTINUE,
+        take_group=0,
+        take_revision_id="",
+        take_action=TAKE_ACTION_AUTOMATIC,
+        size_source=H3_SIZE_SOURCE_LEGACY,
+        width=H3_MANUAL_WIDTH_DEFAULT,
+        height=H3_MANUAL_HEIGHT_DEFAULT,
+        **kwargs,
+    ):
+        resolution = resolve_h3_size_source(
+            size_source=size_source,
+            width=width,
+            height=height,
+            aspect=aspect,
+            preset=preset,
+            custom_mp=custom_mp,
+            first_frame=kwargs.get("first_frame"),
+        )
+        outputs = super().run(
+            width=resolution.width,
+            height=resolution.height,
+            generation_mode=generation_mode,
+            review_action=review_action,
+            take_group=take_group,
+            take_revision_id=take_revision_id,
+            take_action=take_action,
+            reference_encode_cache=True,
+            **kwargs,
+        )
+        # Preserve non-runtime test doubles and any future non-standard facade
+        # result rather than turning diagnostics into an execution requirement.
+        if not isinstance(outputs, tuple) or len(outputs) < 4:
+            return outputs
+        if size_source != H3_SIZE_SOURCE_LEGACY:
+            resolution_lines = [
+                (
+                    f"Resolution: {resolution.width} x {resolution.height} "
+                    f"({resolution.actual_mp:.2f} MP); source={resolution.aspect_source}."
+                )
+            ]
+            resolution_lines.extend(resolution.warnings)
+            status = str(outputs[3]).rstrip() + "\n" + "\n".join(resolution_lines)
+            outputs = (*outputs[:3], status, *outputs[4:])
+        diagnostics_mode = str(kwargs.get("diagnostics", "Basic"))
+        normalized_diagnostics_mode = normalize_diagnostics_mode(diagnostics_mode)
+        if normalized_diagnostics_mode == DIAGNOSTICS_OFF:
+            return outputs
+        try:
+            diagnostics = build_v38_diagnostics(
+                video_latents=outputs[0],
+                audio_latents=outputs[1],
+                assembly_plan=outputs[2],
+                output_width=resolution.width,
+                output_height=resolution.height,
+                chunk_seconds=float(kwargs["chunk_seconds"]),
+                reference_images=(
+                    kwargs.get("reference_image_1"),
+                    kwargs.get("reference_image_2"),
+                    kwargs.get("reference_image_3"),
+                ),
+                reference_size=str(kwargs.get("reference_size", "Match Output")),
+                video_guide=kwargs.get("reference_video_1"),
+                video_guide_size=str(
+                    kwargs.get(
+                        "video_reference_size",
+                        REFERENCE_VIDEO_SIZE_EFFICIENT,
+                    )
+                ),
+                still_guide_active=kwargs.get("guide") is not None,
+            )
+            status = append_v38_status(
+                outputs[3],
+                diagnostics,
+                mode=diagnostics_mode,
+            )
+        except Exception as exc:
+            # Generation already succeeded. Reliability reporting must never
+            # discard or replace a valid Production result.
+            status = str(outputs[3])
+            message = (
+                "V3.8 Reliability\n"
+                "Reliability diagnostics unavailable; generation result was preserved."
+            )
+            if normalized_diagnostics_mode == DIAGNOSTICS_FULL:
+                message += f" ({type(exc).__name__}: {exc})"
+            status = status.rstrip() + "\n" + message
+        return (*outputs[:3], status, *outputs[4:])
+
+
+class H3ContinuumMemoryActionPolicyExperimental:
+    """Explicit opt-in Reference sizing policy for the A7b experiment."""
+
+    DEPRECATED = False
+    CATEGORY = f"{CONTINUUM_CATEGORY}/Advanced"
+    DESCRIPTION = (
+        "Experimental A7b policy. It may reduce connected Reference Image and "
+        "Video Guide sizing by one existing preset step. Automatic MODEL unload "
+        "and attention/backend switching are advisory only and are never executed."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference_action": (
+                    ACTION_OPTIONS,
+                    {
+                        "default": ACTION_DISABLED,
+                        "display_name": "Reference Action",
+                        "tooltip": (
+                            "Disabled is a complete no-op. Reduce References One "
+                            "Step applies only to connected Reference inputs and "
+                            "reuses their existing Production size presets."
+                        ),
+                    },
+                )
+            }
+        }
+
+    RETURN_TYPES = (MEMORY_ACTION_POLICY_TYPE,)
+    RETURN_NAMES = ("memory_action_policy",)
+    FUNCTION = "build"
+
+    def build(self, reference_action=ACTION_DISABLED):
+        return (make_memory_action_policy(reference_action),)
+
+
+class H3ContinuumSamplerV38MemoryPolicyExperimental(H3ContinuumSamplerV38):
+    """V3.8 Experimental facade with one optional A7b policy input."""
+
+    DEPRECATED = False
+    CATEGORY = f"{CONTINUUM_CATEGORY}/Advanced"
+    DESCRIPTION = (
+        "Experimental V3.8 facade for the explicit A7b Reference size action. "
+        "With the policy disconnected or Disabled, it delegates unchanged to "
+        "H3 Continuum Sampler V3.8."
+    )
+    SEARCH_ALIASES = [
+        "H3 Continuum Sampler V3.8 Memory Policy Experimental",
+        "MiniMax H3 A7b",
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        optional = dict(schema.get("optional", {}))
+        optional["memory_action_policy"] = (
+            MEMORY_ACTION_POLICY_TYPE,
+            {
+                "tooltip": (
+                    "Optional explicit A7b policy. No actual-row trigger, MODEL "
+                    "unload, or attention/backend switch is performed."
+                )
+            },
+        )
+        schema["optional"] = optional
+        return schema
+
+    def run(self, memory_action_policy=None, **kwargs):
+        decision = resolve_memory_action_policy(
+            memory_action_policy,
+            image_mode=str(kwargs.get("reference_size", "Match Output")),
+            video_mode=str(
+                kwargs.get(
+                    "video_reference_size",
+                    REFERENCE_VIDEO_SIZE_EFFICIENT,
+                )
+            ),
+            has_reference_images=any(
+                kwargs.get(name) is not None
+                for name in (
+                    "reference_image_1",
+                    "reference_image_2",
+                    "reference_image_3",
+                )
+            ),
+            has_video_guide=kwargs.get("reference_video_1") is not None,
+        )
+        execution_kwargs = kwargs
+        if decision.enabled:
+            execution_kwargs = dict(kwargs)
+            execution_kwargs["reference_size"] = decision.effective_image_mode
+            execution_kwargs["video_reference_size"] = decision.effective_video_mode
+        outputs = super().run(**execution_kwargs)
+        policy_status = format_memory_action_status(decision)
+        if (
+            policy_status is None
+            or not isinstance(outputs, tuple)
+            or len(outputs) < 4
+        ):
+            return outputs
+        status = str(outputs[3]).rstrip() + "\n" + policy_status
+        return (*outputs[:3], status, *outputs[4:])
+
+
 class H3ContinuumAssembleSeamV34(H3ContinuumAssembleSeamExperimental):
     """Assemble decoded chunks and select original Driving Audio when connected."""
 
@@ -644,6 +1091,14 @@ NODE_CLASS_MAPPINGS = {
     "H3ContinuumSamplerV36": H3ContinuumSamplerV36,
     "H3ContinuumStillImageGuideV37": H3ContinuumStillImageGuideV37,
     "H3ContinuumSamplerV37": H3ContinuumSamplerV37,
+    "H3ContinuumSamplerV38": H3ContinuumSamplerV38,
+    "H3ContinuumReferenceAudios": H3ContinuumReferenceAudios,
+    "H3ContinuumMemoryActionPolicyExperimental": (
+        H3ContinuumMemoryActionPolicyExperimental
+    ),
+    "H3ContinuumSamplerV38MemoryPolicyExperimental": (
+        H3ContinuumSamplerV38MemoryPolicyExperimental
+    ),
     "H3ContinuumAssembleSeamV34": H3ContinuumAssembleSeamV34,
     "H3ContinuumAssembleSeamV35": H3ContinuumAssembleSeamV35,
 }
@@ -654,6 +1109,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ContinuumSamplerV36": "H3 Continuum Sampler V3.6",
     "H3ContinuumStillImageGuideV37": "H3 Continuum Still Image Guide V3.7",
     "H3ContinuumSamplerV37": "H3 Continuum Sampler V3.7",
+    "H3ContinuumSamplerV38": "H3 Continuum Sampler V3.8",
+    "H3ContinuumReferenceAudios": "H3 Continuum Reference Audios",
+    "H3ContinuumMemoryActionPolicyExperimental": (
+        "H3 Continuum Memory Action Policy (Experimental)"
+    ),
+    "H3ContinuumSamplerV38MemoryPolicyExperimental": (
+        "H3 Continuum Sampler V3.8 Memory Policy (Experimental)"
+    ),
     "H3ContinuumAssembleSeamV34": "H3 Continuum Assemble + Seam V3.4",
-    "H3ContinuumAssembleSeamV35": "H3 Continuum Assemble + Seam V3.5",
+    "H3ContinuumAssembleSeamV35": "H3 Continuum Finalize",
 }

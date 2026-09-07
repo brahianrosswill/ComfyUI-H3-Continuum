@@ -37,8 +37,12 @@ Get-ChildItem -LiteralPath $source -Force | Where-Object { $exclude -notcontains
 }
 
 $python = Join-Path $ComfyUIRoot "venv\Scripts\python.exe"
+$verifier = Join-Path $destination "tools\verify_runtime.py"
 if (Test-Path $python) {
-    & $python (Join-Path $destination "tools\verify_runtime.py") --comfy-root $ComfyUIRoot
+    if (-not (Test-Path $verifier -PathType Leaf)) {
+        throw "Runtime verifier is missing from the installed package: $verifier"
+    }
+    & $python $verifier --comfy-root $ComfyUIRoot
     if ($LASTEXITCODE -ne 0) {
         throw "Runtime verification failed. See the output above."
     }

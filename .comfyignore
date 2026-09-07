@@ -1,0 +1,40 @@
+tests/
+tools/*
+!tools/__init__.py
+!tools/p20_file_backed_tensor_poc.py
+!tools/verify_runtime.py
+.pytest_cache/
+**/__pycache__/
+*.pyc
+*.pyo
+# Local backup archives are not distribution assets. The official workflow
+# archive is re-included explicitly below.
+*.zip
+
+# Internal source/development records and the source-tree Manifest are not part
+# of the Registry archive. REGISTRY_MANIFEST.sha256 covers the staged package.
+AGENTS.md
+PROJECT_STATE.md
+WORKLOG.md
+MANIFEST.sha256
+
+# Repository-only automation and test configuration are not runtime assets.
+.github/
+.gitignore
+.gitattributes
+pytest.ini
+
+# Ship only current V3.8 public contracts. Historical validation notes,
+# version-specific design documents, and their screenshots stay in source.
+docs/*
+!docs/N2B_BRANCH_PROVENANCE_CONTRACT_V1.md
+!docs/V38_OPEN_INTEGRATION_CONTRACT.md
+!docs/V38_RELEASE_AND_MIGRATION.md
+
+# One user-supplied Spectrum graph, in JSON and ZIP forms. External custom-node
+# dependencies are documented, not bundled. Historical examples stay in Git.
+examples/*
+!examples/workflows/
+examples/workflows/*
+!examples/workflows/MiniMax_H3_Continuum_V38.json
+!examples/workflows/MiniMax_H3_Continuum_V38.zip

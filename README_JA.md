@@ -1,8 +1,150 @@
-# ComfyUI-H3-Continuum 3.7.0
+# ComfyUI-H3-Continuum 3.8.0
 
 MiniMax H3を複数チャンクで連続生成し、直前チャンク末尾の**映像latent / 音声latentを直接**次チャンクへ継承するComfyUIカスタムノードです。チャンク間でVideo/Audio VAEのDecode→Encodeは行いません。
 
-## V3.7 高解像度Refinement基盤
+## インストール・更新
+
+新規導入：
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum.git
+```
+
+既存のGit導入を更新：
+
+```bash
+cd ComfyUI/custom_nodes/ComfyUI-H3-Continuum
+git pull --ff-only origin main
+```
+
+ComfyUIを再起動してください。Managerから導入した場合はManagerのUpdateを使い、同じノードを重複配置しないでください。
+
+V3.8 Workflow：[JSON](examples/workflows/MiniMax_H3_Continuum_V38.json)／[同じJSONを含むZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip)。Spectrumを初期設定とする1本です。[LightX2V Turbo](https://github.com/ModelTC/Minimax-H3-Turbo)にも切り替えられますが、完全なgraphを開くにはSpectrum・rgthree・KJNodes・ComfyUI-Easy-Useが必要です。外部ノードは別途導入してください。
+
+## V3.8の公開範囲
+
+H3 Continuumは、長尺映像を最初からやり直さずに生成・確認・部分再生成・再開するProduction Samplerです。V3.8は`Main / Production`と`Advanced`の2層に整理しました。
+
+V3.8で検索可能な公開ノードは次の7つです。
+
+- `H3 Continuum Sampler V3.8`
+- `H3 Continuum Finalize`
+- `H3 Continuum Load Image`
+- `H3 Continuum Load Audio`
+- `H3 Continuum Load Video`
+- `H3 Continuum Second Pass`
+- `H3 Continuum Reference Audios`
+
+Main Sampler内の`Show Advanced Settings`／`Hide Advanced Settings`で詳細設定を開閉します。旧node property `H3 Continuum View`を含む保存Workflowは対応する開閉状態へ移行し、旧propertyを削除します。これは表示状態だけの変更です。Python input、widget順、保存済みwidget値、backend引数、Sampling identity、Run Storage identityは変更しません。Frontend extensionが読み込まれない場合も、Python定義の全widgetが表示された状態で実行できます。
+
+標準経路は`Sampler V3.8 -> Core Video/Audio Decode -> Finalize -> Create Video -> Save Video`です。Finalizeの`IMAGE`／`AUDIO`出力をCoreの`Create Video`で`VIDEO`へまとめてから保存します。Core Decode、Save、Upscalerは外付けとし、外部latent processorやupscalerはSecond Passをbridgeとして接続します。外部processorが変更できるのはVideo LATENTの空間解像度だけで、physical group、B/C/T、finite値、First Pass Audio、元のAssembly Planを維持する必要があります。Finalizeは公開`IMAGE`／`AUDIO`型を受け取り、特定decoder classへ依存しません。SageAttention、Sol-Attn、Spectrumは外部MODEL wrapperのままです。詳細は[V3.8 Open Integration Contract](docs/V38_OPEN_INTEGRATION_CONTRACT.md)を参照してください。旧Hi-Res FixはV3.8標準Workflowに含めません。
+
+### Reference Audio 1/2/3
+
+`H3 Continuum Reference Audios`は、最大3本の単独Reference Audioを1本の`Audio References (Optional)` socketへまとめます。入力は間を空けずに接続し、Promptでは接続順どおりに`<Audio 1>`、`<Audio 2>`、`<Audio 3>`を使用します。共通のCore Audio VAEで各Audioを個別encodeします。生成後の最終Audioを置換せず、Driving Audio契約も変更しません。既存Workflowは従来の単数`Reference Audio (Optional)`をそのまま使用できますが、単数経路とbundle経路は同時接続しないでください。
+
+> **V3.8 support boundary:** V3.8からexportするのは上記7ノードだけです。Finalizeの`H3ContinuumAssembleSeamV35`、Second Passの`H3ContinuumSecondPassV35`など、公開ノードの一部は旧IDを維持していますが、すべての旧Workflowに互換性があるという意味ではありません。現在の7ノード以外のIDを含む保存Workflowはunknown nodeになる場合があります。その場合は対応するhistorical Release/tagを使用してください。詳細は[V3.8 Release／Migration Policy](docs/V38_RELEASE_AND_MIGRATION.md)を参照してください。
+
+複雑な16GB GPU受入Gateでは約`15.5～15.6 GiB`を使用しました。GPU、driver、backend、model精度、解像度、接続ノードで変動するため、すべての16GB GPUでの動作保証ではありません。
+
+### サイズの決め方を直接選択
+
+| Preset | 目安 |
+|---|---|
+| `Draft` | 約0.30 MP |
+| `Balanced` | 約0.60 MP |
+| `Native 768` | 短辺768を目標。極端なAspectでは長辺1344 capを優先 |
+| `Custom MP` | Megapixelを直接指定。Native 768のcapとは別 |
+
+Mainの`Size Source`は次の2択です。
+
+- `First Image`：接続したFirst Imageの縦横比を維持し、Presetの目標面積から最終Width／Heightを算出します。
+- `Manual`：Width／Heightを32 pixel単位で直接指定します。この場合、Presetは適用しません。
+
+MainのWidth／Heightは`Manual`のときだけ表示・編集できます。`First Image`ではResolutionを表示し、画像の縦横比からサイズを決めます。有効なFirst ImageがSamplerへ届かない場合は、保持しているManual Width／Heightへフォールバックし、その寸法をStatusへ表示します。手動寸法を確認・変更する場合は`Size Source = Manual`を選びます。Reference ImageやVideo Guideからサイズを暗黙取得することはありません。
+
+旧V3.8の`Auto / Landscape / Portrait / Square`はWorkflow／API互換用として内部で受け付けます。FrontendはAutoをFirst Imageへ、3つの固定Aspectを同じ解決結果のManual Width／Heightへ移行します。
+
+### 10秒を5秒ずつ確認しながら作る
+
+ここでは、画面に表示される名前だけを使って手順を説明します。
+
+#### 最初に知っておくこと
+
+`Chunks = 2`、`Seconds per Chunk = 5`は、完成目標が合計10秒という意味です。ただし、`Run = Review Each Chunk`では10秒を一度に生成しません。最初のQueueでは、確認用に**Chunk 1の5秒だけ**を生成します。これは正常動作です。
+
+Chunk 1を確認した後に操作を選び、もう一度QueueするとChunk 2へ進みます。`Chunks = 1`では最初の5秒が最後なので、次へ進む操作はありません。
+
+#### 手順1：生成前の設定
+
+`H3 Continuum Sampler V3.8`で、上から次の順に設定します。
+
+1. `Control After Generate`を`fixed`にします。`randomize`、`increment`、`decrement`では続きを再利用できません。
+2. `Chunks`を`2`にします。
+3. `Seconds per Chunk`を`5`にします。
+4. `Total Length`が`10 seconds`になったことを確認します。`Total Length`は確認表示で、直接変更する項目ではありません。
+5. `Run`を`Review Each Chunk`にします。
+6. `Progress`を`On — Resume and Takes available`にします。
+7. 緑色の`Ready to Queue`欄に、`2 × 5s = 10 seconds`と`Review each chunk`が表示されていることを確認します。`Set Control After Generate to fixed`と表示された場合は、Queueする前に手順1を直します。
+
+#### 手順2：最初の5秒を作る
+
+1. ComfyUIの`Queue`を押します。
+2. Chunk 1だけが生成されます。出力動画が5秒でも正常です。
+3. Queueの処理が完了すると、Samplerの表示が自動的に`Chunk 1 is ready for review`へ切り替わります。
+
+#### 手順3：Chunk 1の動画を確認する
+
+保存された5秒の動画を再生し、そのまま採用するか、作り直すかを決めます。この時点ではまだ合計10秒の動画は完成していません。
+
+#### 手順4：次の操作を1つ選ぶ
+
+| 画面上のボタン | 次のQueueで行うこと |
+|---|---|
+| `Use it and continue` | 現在の5秒を採用し、次のChunkを1つ生成します。 |
+| `Try this chunk again` | 現在のChunkだけを別のTakeとして作り直します。 |
+| `Use it and finish the rest` | 現在までを採用し、残りのChunkをまとめて生成します。 |
+
+ボタンを選んだだけでは生成は始まりません。選択したボタンに`✓`が付いたことを確認してから、ComfyUIの`Queue`を押します。
+
+`Try this chunk again`はContinuum側で別Takeを作るため、作り直しでも`Control After Generate`は`fixed`のままにしてください。
+
+#### 手順5：2本目の5秒を作り、10秒を完成させる
+
+1. `Use it and continue`を選びます。
+2. ComfyUIの`Queue`をもう一度押します。
+3. 採用済みのChunk 1を再利用し、Chunk 2を生成します。
+4. Samplerから後ろのDecode、`H3 Continuum Finalize`、Save Videoまで通常どおり実行されると、合計10秒の完成動画が出力されます。
+
+設定を確認し直したい場合は`Back to Settings`を押します。未処理のReviewへ戻る場合は`Return to Review`を押します。どちらも生成を自動開始せず、選択済みのTakeや保存済みChunkも削除しません。
+
+#### 迷ったときの確認
+
+- 最初のQueueで5秒だけ出た：`Review Each Chunk`の正常動作です。
+- 次へ進むボタンが出ない：Queueが完了しており、`Progress = On — Resume and Takes available`、`Chunks = 2`以上であることを確認してください。正常なら完了後に自動表示されます。
+- ボタンを押しても生成されない：操作を選んだ後、ComfyUIの`Queue`をもう一度押してください。
+- `Set Control After Generate to fixed`と表示された：`Control After Generate`を`fixed`にしてください。別SeedのChunk 1が増えることを防ぐ安全チェックです。
+- 1回で10秒すべて作りたい：`Run`を`Generate Full Video`にします。
+
+Long Terminal Mergeのpairは分割せず、1つのReview単位として扱います。
+
+Driving AudioはReview／Smart Regenerateと併用できます。Continuum Image／Audio／Video Loaderは任意入力向けのnative bypassに対応します。
+
+> **Reviewの制限:** Review途中のpartial sequenceでは、Second Pass／`refine_context`を正式対応範囲に含めません。Reviewを完了してsequenceを確定してからSecond Passを実行してください。
+
+### Take・Branch・安全な継続
+
+Run Storageを有効にすると、Production表示に**Render History / Takes**が表示されます。
+Takeを選択してもcanonical結果は変わりません。**Use This Take**でそのrevisionを
+canonicalにし、**Continue From Here**で選択したTakeまでを保持して後続groupだけを
+再生成します。どちらの操作も自動Queueは行いません。
+
+## 歴史的な実装・受入記録（V3.8標準Workflowではありません）
+
+以下の節は旧リリースと互換性作業の記録です。上記のV3.8標準経路を変更するものではありません。
+
+### V3.7 高解像度Refinement基盤
 
 V3.7では`H3 Continuum Sampler V3.7`を追加し、解像度を変更するSecond Passに必要な2つの基盤を完成させました。V3.6のProduction初期値と既存SIGMAS socketは変更していません。
 
@@ -18,7 +160,7 @@ Conditioning Adapterは、First／Last Image、Continuation context、Still Imag
 
 V3.7では、Still Image Guide 1枚をabsolute frameからowner physical groupへ割り当て、高解像度Second Passでも元画像から再encodeできます。位置変換、Terminal Merge ownership、Run Storage identity、non-owner groupの非干渉はCorrectness PASSです。一方、Core Add Guideはhard anchorとして働くため、anchor位置で急なtrajectory変化が起き、その後のmotionも別の軌道へ分岐する場合があります。**Still Image GuideはExperimentalで、Production昇格はHOLDです。** 滑らかなtransition制御としては扱わないでください。
 
-## V3.6.1 Maintenance Hotfix
+### V3.6.1 Maintenance Hotfix
 
 V3.6.1は、受入済みBalanced 22 Masked AV経路を変更せず、限定的なfail-open／互換性問題を修正します。Timeline/List記法が混在したPromptは`H3C-P105`を表示し、Timeline解析ではstandalone `---`行だけを除去します。未指定Chunkの既存fallbackとFixed Promptのfail-open動作は維持し、Prompt構文だけを理由に生成を停止しません。
 
@@ -26,7 +168,7 @@ V3.6.1は、受入済みBalanced 22 Masked AV経路を変更せず、限定的�
 
 Run Storageは、Last Frame未接続を表す値をすべて同じ空identityとして扱います。通常のLast Frameなし2チャンク生成を3チャンクへ延長すると、旧最終Chunkが`none`だったV3.6.1 cacheを含めて`2 reused, 1 generated`になります。実Last Frame接続時とLong Terminal Mergeのatomic pairは従来どおり厳密です。Run StorageをOffへ変更した場合は、Queue前にhiddenのRegenerate FromとVariation Nonceも`Auto`と`0`へ戻します。
 
-## V3.6 Masked AV Continuation
+### V3.6 Masked AV Continuation
 
 V3.6では`H3 Continuum Sampler V3.6`を追加しました。標準backendは、前Chunkで確定したVideo／Audio latent prefixを次のH3 Target内へ直接配置し、CoreのNoise Maskで保持します。V3.5のReference Context方式のように、同じ過去フレームを別Reference blockとして追加しないため、H3が処理するpacked sequenceを短縮できます。
 
@@ -80,7 +222,7 @@ Prompt/CLIPの数値はconditioning区間だけで、総生成時間ではあり
 
 RTX 5060 Ti 16 GB／RAM 64 GBの検証環境で測定したSage-only Production baselineは、576×576 T2VA 1×5秒が168.069秒、640×640 FL2VA Long Terminal Merge 3×5秒が379.765秒です。環境・設定固有の測定値であり、すべての環境に対する速度保証ではありません。Samplingが最大コストで、Continuum Assemble + Seamは1%未満でした。
 
-**V3.7.0が現在の公開版です。** V3.6.1はmaintenance／compatibility baselineとして維持します。旧Node ID、backend socket key、保存済みWorkflow読込は維持し、Production初期値は変更していません。Still Image GuideはExperimentalです。
+**V3.8.0が現在のRelease Candidateです。** V3.8が内部利用する旧module/classはsourceへ維持します。exportするのは現在の公開7ノードだけで、その一部は旧IDを維持しています。それ以外のIDを必要とする旧保存Workflowは、対応するhistorical Release/tagを使用してください。Still Image Guideは引き続きExperimentalです。
 
 ## V3.5.1 Reference Audio／互換性更新
 
@@ -199,21 +341,20 @@ Hi-Res Fixを接続しなければV3.4 Sampling経路は変わりません。強
 
 詳しいsocket接続・OFF時のpassthrough・既知の制限は[英語版V3.5接続ガイド](docs/V35_HIRES_FIX.md)を参照してください。
 
-## 推奨テンプレートワークフロー
+## 公開テンプレートワークフロー
 
-- [V3.6推奨テンプレート](examples/workflows/MiniMax_H3_Continuum_V36.json)
-- [V3.5互換テンプレート](examples/workflows/MiniMax_H3_Continuum_V35.json)
-- [V3.5.1 LBH＋Conditioning Bridge接続例](examples/workflows/MiniMax_H3_Continuum_V351_LBH_Conditioning_Bridge.json)
+- [V3.8 Workflow JSON](examples/workflows/MiniMax_H3_Continuum_V38.json) — Spectrum初期設定の現行graph 1本
+- [V3.8 Workflow ZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip) — 同じJSONのみを格納。カスタムノードのインストーラーではありません
 
-V3.6テンプレートはContinuation BackendがStandard、Hi-Res Fixが初期OFF、AssembleのBuffer BackendがAutoです。First Frame、Last Frame、Reference Image 1～3は1つのmegapixel設定を共有します。`Video Guide Size`は`Video Guide Frames`に使うframe batchを調整し、decodeとframe-rate変換はVideo loader側で行います。現在のProduction構成はV3.6 SamplerとV3.5の低メモリAssembleを組み合わせます。V3.5テンプレートは互換用として変更せず維持します。
+Registry配布予定の対象もこのJSONとZIPです。依存なしのテンプレートではなく、Spectrum・rgthree・KJNodes・ComfyUI-Easy-Useが必要です。Turboへ切り替えてもgraph内の外部ノードは残ります。SpectrumをOFFにし、用途に合うLightX2V Turbo LoRAを1本だけONにしてsampler／Stepsを合わせます。初期状態はSpectrum ON、Turbo LoRA OFF、res_multistep／simple／20 Stepsです。
 
-![H3 Continuum Sampler V3.6](docs/images/v36-sampler-node.png)
+配布元のprompt、画像・音声名、ノード表示名、設定は変更していません。手元にあるファイルを選び、不要な入力をOFFにし、promptを入力してください。モデルやメディアは同梱しません。`Save 3x5s Video`などの保存済み表示名は生成時間を決めません。実際の長さはSamplerのChunksとSeconds per Chunkで決まります。
 
-![H3 Continuum Assemble + Seam V3.5](docs/images/v35-assemble-seam-node.png)
+旧Workflowは開発履歴としてsource repositoryへ保持しますが、V3.8 Registry packageからは除外します。旧保存Workflowは[Migration Policy](docs/V38_RELEASE_AND_MIGRATION.md)に従い、対応するhistorical Release/tagで開いてください。Registryの正式pack検証・公開はGitHub sourceの更新とは別工程です。
 
 ## V3.4互換
 
-V3.4ノードは保存済みワークフローを壊さないため残しています。Node ID、公開socket、Sampling、Conditioning、Terminal Merge、Assembly、Seam、Run StorageをV3.5へ置換していません。Second PassやDisk-backed Assembleを必要としない場合は、従来どおりV3.4を使用できます。
+V3.4の実装moduleは内部継承とhistorical testのためsourceへ保持しています。V3.8からexportするのは現在の公開7ノードに含まれるIDだけです。それ以外のIDを必要とするV3.4保存Workflowは、対応するhistorical packageを使用してください。
 
 ## V3.4.0 Stable
 
@@ -246,7 +387,10 @@ Reference入力のバイパスされたソケットは無視され、有効な�
 
 1. Run Name、Base Seed、model、LoRA、解像度、sampler、SIGMAS／steps、Reference、Continuity設定を初回と同じに保ちます。
 2. `Regenerate From`を`Chunk 2`にします。
-3. Workflowをもう一度Queueします。
+3. `Variation Nonce = 0`なら、完了済みの再生成に対して新しいバリエーションを自動選択します。互換性のある未完了runを再開する場合は、既存のバリエーションを引き継ぎます。`1以上`は指定値を固定するため、同じ入力で別の結果を求める場合は別の正の値へ変更します。Base Seedは固定のままにします。
+4. Workflowをもう一度Queueします。
+
+Review画面の`Try this chunk again`は、この手動指定とは別に、内部のバリエーションを自動で進めます。
 
 Continuumは保存済みChunk 1を再Samplingせずに読み込み、その確定済み末尾をContinuation contextとして新しいChunk 2をSamplingします。Reportの目安は`1 reused, 1 generated`です。その後、10秒全体を再Decode／Assemblyします。第1ChunkのSampling結果は再利用され、境界のSeam処理は新しいAssembly時に再評価されます。
 
@@ -297,7 +441,7 @@ outputs: images / audio / result
 
 ### Legacy互換
 
-旧`H3ContinuumSamplerV2`は削除せずLegacy/Coreノードとして登録を維持します。既存WorkflowのノードID、入力順、出力順は変更していません。
+当時のV2.1.7では、旧`H3ContinuumSamplerV2`をLegacy/Coreノードとして登録し、既存WorkflowのノードID、入力順、出力順を維持していました。これはV3.8の公開範囲を示す説明ではありません。このIDを使う旧Workflowは対応するhistorical Release/tagで開いてください。
 
 ## Continuity
 
@@ -322,15 +466,21 @@ UNET -> SageAttention -> Sol-Attn -> LoRA -> Spectrum -> H3 Continuum Sampler
 
 ## インストール
 
-ComfyUI 0.32.0以上が必要です。ComfyUI 0.33.3でパッケージ検証、0.34.0でV3.6.1 GPU Smoke、0.34.2でV3.7 Conditioning／RefineSchedule Correctness Gateを検証済みです。ComfyUIの最新版は必須ではありません。
+V3.8はComfyUI 0.34.2で検証しています。以下の歴史的な受入記録には旧ComfyUI版も登場しますが、現在のインストール目標ではありません。V3.8の依存を満たす限り、ComfyUIの最新版は必須ではありません。
 
 ZIPを展開して、`ComfyUI-H3-Continuum`フォルダーを`ComfyUI/custom_nodes/`へ置き、ComfyUIを再起動します。
+
+再起動後は`H3 Continuum Sampler V3.8`を検索してください。V3.8の検索面は上記7ノードだけです。
 
 旧`ComfyUI-H3-Continuum-Join`が残っている場合は同時ロードを避けるため削除または退避してください。同梱`install_windows.bat`は旧名・新名の既存フォルダーを日時付きでバックアップします。
 
 ## 検査
 
-V3.6 release gateはPIG-0～PIG-5を完了し、backend別Run Storage、実cache Save／Resume／Regenerate From、Terminal Mergeのatomic再利用、Reference Image／Audio保持、保護prefix bit-exact、GPU Workflow、Audio Seam数値検証、実聴Audio PASSを含みます。最終自動検証は`527 passed`で、完全なpackage checklistは`PACKAGE_VALIDATION.txt`へ記録しています。source/runtime登録、PackedLayout、Fixed 3×5 Prompt Plan、JavaScript UI harness、Prompt/CLIP cache一致、Video Guide bit-exact A/B、V3.5 Second Pass／Hi-Res、V3.5.3配布整合性の回帰も維持します。
+現在のV3.8 Public Surface suiteは、正確な7 ID export、Spectrum graph 1本とZIP内JSONの同一性、外部依存、Registry除外、既存V3.8 widget/socket順を維持したAUDIO-R1 socket末尾追加、`Show Advanced Settings`／`Hide Advanced Settings`による表示切替と旧`H3 Continuum View` propertyからの移行を確認します。Registry配布対象のハッシュは`REGISTRY_MANIFEST.sha256`、source側の対象ファイルは`MANIFEST.sha256`で管理します。Gitの改行変換は無効にして配布バイト列を維持します。旧実装はmodule-local testで維持しますが、それによってV3.8の公開ノードが増えることはありません。
+
+**配布名の最終整理前のCPU総検証（2026-09-07）：1,154/1,154 PASS。** failure、error、skip、記録されたCUDA初期化要求はいずれも0件でした。ComfyUI Core 0.34.5の隔離CPU検査で7ノード登録とnative PackedLayoutを確認し、旧Core-onlyテンプレートと提供されたSpectrum graphのgraph／schemaも確認しました。CUDAは未初期化のままです。最終配布ではSpectrum graphを変更せず汎用のV38ファイル名に統一します。これはCPU上のソフトウェア契約の検証であり、新たなGPU画質PASSや、起動中の実行環境へ最新版が反映されたことを示すものではありません。
+
+**過去のV3.6受入記録：** PIG-0～PIG-5を完了し、backend別Run Storage、実cache Save／Resume／Regenerate From、Terminal Mergeのatomic再利用、Reference Image／Audio保持、保護prefix bit-exact、GPU Workflow、Audio Seam数値検証、実聴Audio PASSを含みます。当時の自動検証は`527 passed`であり、現在のV3.8 CPUテスト件数ではありません。package checklistと過去の受入記録は`PACKAGE_VALIDATION.txt`にあります。source/runtime登録、PackedLayout、Fixed 3×5 Prompt Plan、JavaScript UI harness、Prompt/CLIP cache一致、Video Guide bit-exact A/B、V3.5 Second Pass／Hi-Res、V3.5.3配布整合性の回帰も維持します。
 
 Main Hi-Res Fixの3×5秒2xは、RTX 5060 Ti 16 GiBで37T groupの1152×1152 Second Pass完了後、Terminal Mergeの77T group最初の推論時にCUDA OOMとなり未受入です。Reference/Hybrid固有の1×5秒Second Passは受入済みですが、長尺Reference/Hybridは未確認です。Disk-backedが保証する低メモリ範囲はContinuum Assemblyであり、Core Decodeや下流ノードが別の全量copyを作る可能性は残ります。
 

@@ -92,13 +92,14 @@ def test_run_storage_off_normalizes_widgets_reload_and_queued_inputs(tmp_path):
             _function_source(source, "findWidget", "setWidgetVisible"),
             _function_source(source, "setWidgetVisible", "hidePersistentWidget"),
             _function_source(source, "linkedInput", "attachRefresh"),
-            _function_source(source, "attachRefresh", "normalizeRunStorageState"),
+                _function_source(source, "attachRefresh", "normalizedV38View"),
             _function_source(source, "normalizeRunStorageState", "configureConditionalWidgets"),
             _function_source(source, "configureConditionalWidgets", "configureAssembler"),
         ]
     )
     script = f"""
-const RUN_STORAGE_WIDGET = "run_storage";
+    const RUN_STORAGE_WIDGET = "run_storage";
+    const V38_NODE_CLASS = "H3ContinuumSamplerV38";
 const REGENERATE_WIDGET = "reroll_from_chunk";
 const REROLL_NONCE_WIDGET = "reroll_nonce";
 const LEGACY_RUN_NAME_WIDGET = "run_name";

@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.8.0
+
+### Added
+
+- Established the seven-node V3.8 public surface: Sampler V3.8, Finalize, Load Image, Load Audio, Load Video, Second Pass, and the modular Reference Audios helper. Unreleased Easy facade prototypes remain in source but are not registered.
+- Added `H3 Continuum Sampler V3.8` with shared `Draft` 0.30 MP, `Balanced` 0.60 MP, `Native 768`, and `Custom MP` resolution presets.
+- Added `Review Each Chunk`, `Continue / Next`, `Regenerate Current`, and `Finish Remaining` controls backed by Run Storage review branches and canonical-head recovery.
+- Publish one user-supplied V3.8 Spectrum workflow unchanged as JSON and ZIP. It requires Spectrum, rgthree, KJNodes, and ComfyUI-Easy-Use; the same graph can be switched to a task-matched LightX2V Turbo LoRA.
+- Added Continuum Image, Audio, and Video loaders with explicit native bypass behavior for optional workflow inputs.
+- Added `H3 Continuum Reference Audios`, which bundles up to three ordered Core-native standalone audio references behind one appended V3.8 Sampler socket while preserving the legacy single-reference path.
+- Replaced the Main `Landscape / Portrait / Square` choice with a two-path `Size Source`: preserve the connected First Image aspect at the selected preset, or enter an exact aligned Manual Width and Height.
+
+### Improved
+
+- Integrated Driving Audio with Review, Smart Regenerate, Finish Remaining, and restart persistence.
+- Preserved FL2VA Long Terminal Merge as one atomic physical review unit, including Smart Regenerate of the complete terminal pair.
+- Reused one resolution resolver across Easy and normal V3.8 samplers while leaving the V3.7 schema and Production path unchanged.
+- Extended Run Storage with Review lifecycle metadata, prefix reuse, nonce branches, and latest canonical-head restoration without changing the sampling identity contract.
+- Added a frontend-only `Basic / Production` node property for Sampler V3.8. It changes presentation only and preserves the Python schema, widget order and values, backend inputs, Sampling identity, and Run Storage identity.
+- Added Registry packaging rules that exclude tests, tools, diagnostics, Labs assets, and historical workflows while retaining all runtime-imported implementation modules.
+- Kept the old V3.8 Aspect input as a hidden compatibility field. Saved Auto workflows migrate to First Image, while saved Landscape, Portrait, and Square workflows migrate to the same resolved Manual canvas.
+
+### Notes
+
+- Second Pass / `refine_context` is not supported on a partial Review sequence. Complete Review before running Second Pass.
+- The 16GB GPU Gate passed with small headroom: Strict Minimal peaked at `14.96 GiB`, and complex accepted gates reached about `15.5-15.6 GiB`. Results vary by environment and are not a universal 16GB guarantee.
+- Still Image Guide remains Experimental. V3.7 and earlier Node IDs are not exported by V3.8; workflows using them can appear with unknown nodes and should be opened with the matching historical Release/tag.
+
 ## 3.7.0
 
 - Added `H3 Continuum Sampler V3.7` with one optional Still Image Guide input while preserving the V3.6 required-input schema, Production defaults, and saved-workflow compatibility.

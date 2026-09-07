@@ -1,0 +1,26 @@
+{
+  "last_node_id": 420,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 420,
+      "type": "H3ContinuumSelectiveSecondPassExperimental",
+      "pos": [0, 0],
+      "size": [360, 420],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "H3ContinuumSelectiveSecondPassExperimental"
+      },
+      "widgets_values": [73, "Video + Audio"]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

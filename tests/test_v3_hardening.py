@@ -153,6 +153,43 @@ def test_storage_stats_deduplicate_shared_storage():
     assert stats["unique_storages"] == 1
 
 
+def test_memory_snapshot_does_not_probe_uninitialized_cuda(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise BaseException("CPU diagnostics must not query CUDA counters")
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    for name in ("is_available", "memory_allocated", "memory_reserved", "mem_get_info"):
+        monkeypatch.setattr(torch.cuda, name, forbidden)
+    tensor = torch.zeros((2, 3))
+    original = tensor.clone()
+    rng = torch.random.get_rng_state().clone()
+    text = hardening.format_memory_snapshot("CPU", tensor)
+    assert "CUDA_allocated=n/a, CUDA_reserved=n/a, CUDA_free=n/a" in text
+    assert "CPU_storage=" in text
+    assert torch.equal(tensor, original)
+    assert torch.equal(torch.random.get_rng_state(), rng)
+
+
+def test_memory_snapshot_preserves_initialized_cuda_counters(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 2 * 1024**2)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 3 * 1024**2)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (4 * 1024**2, 8 * 1024**2))
+    text = hardening.format_memory_snapshot("mock initialized CUDA")
+    assert "CUDA_allocated=2.0 MiB, CUDA_reserved=3.0 MiB, CUDA_free=4.0 MiB" in text
+
+
+def test_memory_snapshot_counter_failure_is_diagnostic_only(monkeypatch):
+    def unavailable():
+        raise RuntimeError("counter unavailable")
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", unavailable)
+    text = hardening.format_memory_snapshot("counter failure", torch.zeros(1))
+    assert "CUDA_allocated=n/a, CUDA_reserved=n/a, CUDA_free=n/a" in text
+    assert "tensor_refs=1" in text
+
+
 def test_session_storage_audit_reports_shared_cpu_storage():
     video = torch.zeros((1, 2, 3))
     audio = torch.zeros((1, 2, 4))

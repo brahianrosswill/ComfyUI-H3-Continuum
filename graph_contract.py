@@ -104,18 +104,29 @@ def build_upstream_graph_contract(
     safe = True
     reasons: list[str] = []
     specs = [
-        ("model", True),
-        ("clip", True),
-        ("video_vae", bool(require_video_vae)),
+        ("model", "model", True),
+        ("clip", "clip", True),
+        ("video_vae", "video_vae", bool(require_video_vae)),
     ]
     if require_reference_audio_vae:
-        specs.append(("reference_audio_vae", True))
+        reference_audio_route = "reference_audio_vae"
+        direct_link = inputs.get(reference_audio_route)
+        if not (
+            isinstance(direct_link, (list, tuple))
+            and len(direct_link) == 2
+            and isinstance(direct_link[0], (str, int))
+            and isinstance(direct_link[1], int)
+        ):
+            reference_audio_route = "audio_references"
+        # Keep the established descriptor key. The bundled route fingerprints
+        # the helper and therefore its Audio VAE plus every ordered source.
+        specs.append(("reference_audio_vae", reference_audio_route, True))
     if require_audio_vae:
-        specs.append(("audio_vae", True))
-    for name, required in specs:
+        specs.append(("audio_vae", "audio_vae", True))
+    for name, input_name, required in specs:
         if not required:
             continue
-        link = inputs.get(name)
+        link = inputs.get(input_name)
         if not (
             isinstance(link, (list, tuple))
             and len(link) == 2

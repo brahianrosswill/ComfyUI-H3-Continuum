@@ -1,0 +1,3 @@
+# Release manifests and the user-supplied workflow ZIP hash exact file bytes.
+# Keep Git checkout/add from rewriting line endings on Windows or Linux.
+* -text

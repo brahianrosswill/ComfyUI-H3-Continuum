@@ -233,9 +233,7 @@ def test_v35_is_registered_with_v34_outputs_then_refine_context():
     assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumSamplerV35"] == (
         "H3 Continuum Sampler V3.5"
     )
-    assert root_nodes.NODE_CLASS_MAPPINGS["H3ContinuumSamplerV35"] is (
-        H3ContinuumSamplerV35
-    )
+    assert "H3ContinuumSamplerV35" not in root_nodes.NODE_CLASS_MAPPINGS
     assert H3ContinuumSamplerV35.RETURN_TYPES[:5] == H3ContinuumSamplerV34.RETURN_TYPES
     assert H3ContinuumSamplerV35.RETURN_NAMES[:5] == H3ContinuumSamplerV34.RETURN_NAMES
     assert H3ContinuumSamplerV35.RETURN_TYPES[5] == "H3_CONTINUUM_REFINE_CONTEXT"

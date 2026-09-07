@@ -104,6 +104,34 @@ def _validate_image(name: str, image: torch.Tensor) -> torch.Tensor:
     return image[:, :, :, :3]
 
 
+def resolve_reference_image_size(
+    source_width: int,
+    source_height: int,
+    *,
+    output_width: int,
+    output_height: int,
+    size_mode: str,
+) -> tuple[int, int]:
+    """Resolve Reference Image geometry without resizing or reading pixels."""
+
+    if size_mode not in REFERENCE_SIZE_OPTIONS:
+        raise ReferenceConditioningError(f"unknown Reference Size: {size_mode!r}")
+    source_width = int(source_width)
+    source_height = int(source_height)
+    if size_mode == REFERENCE_SIZE_MATCH_OUTPUT:
+        target_area = float(int(output_width) * int(output_height))
+        scale = min(1.0, math.sqrt(target_area / float(source_width * source_height)))
+    else:
+        scale = min(
+            1.0,
+            float(_MAX_IDENTITY_SHORT_EDGE) / min(source_width, source_height),
+        )
+    return (
+        _round_canvas(source_width * scale),
+        _round_canvas(source_height * scale),
+    )
+
+
 def _resize_reference(
     image: torch.Tensor,
     *,
@@ -111,17 +139,15 @@ def _resize_reference(
     output_height: int,
     size_mode: str,
 ) -> torch.Tensor:
-    if size_mode not in REFERENCE_SIZE_OPTIONS:
-        raise ReferenceConditioningError(f"unknown Reference Size: {size_mode!r}")
     source_height = int(image.shape[1])
     source_width = int(image.shape[2])
-    if size_mode == REFERENCE_SIZE_MATCH_OUTPUT:
-        target_area = float(int(output_width) * int(output_height))
-        scale = min(1.0, math.sqrt(target_area / float(source_width * source_height)))
-    else:
-        scale = min(1.0, float(_MAX_IDENTITY_SHORT_EDGE) / min(source_width, source_height))
-    target_width = _round_canvas(source_width * scale)
-    target_height = _round_canvas(source_height * scale)
+    target_width, target_height = resolve_reference_image_size(
+        source_width,
+        source_height,
+        output_width=int(output_width),
+        output_height=int(output_height),
+        size_mode=size_mode,
+    )
     if target_width == source_width and target_height == source_height:
         return image.contiguous()
     try:
@@ -191,6 +217,46 @@ def encode_reference_latents(video_vae: Any, assets: ReferenceAssets) -> Referen
         return assets
     latents = tuple(video_vae.encode(image) for image in assets.images)
     return replace(assets, latents=latents)
+
+
+def encode_reference_latents_cached(
+    video_vae: Any,
+    assets: ReferenceAssets,
+    *,
+    cache_event=None,
+) -> ReferenceAssets:
+    """Encode V3.8 Reference Images with the process-local VAE cache."""
+
+    if all(latent is not None for latent in assets.latents):
+        return assets
+    from .v3.ref_encode_cache import (
+        get_ref_encode_cache,
+        make_ref_encode_cache_key,
+    )
+
+    cache = get_ref_encode_cache()
+    latents: list[torch.Tensor] = []
+    for image, image_hash, existing in zip(
+        assets.images,
+        assets.image_hashes,
+        assets.latents,
+        strict=True,
+    ):
+        if existing is not None:
+            latents.append(existing)
+            continue
+        key = make_ref_encode_cache_key(
+            "reference_image",
+            REFERENCE_PREPROCESS_VERSION,
+            image_hash,
+        )
+        latent = cache.lookup(video_vae, key, event_sink=cache_event)
+        if latent is None:
+            latent = video_vae.encode(image)
+            if cache.supports_vae(video_vae):
+                cache.store(video_vae, key, latent, event_sink=cache_event)
+        latents.append(latent)
+    return replace(assets, latents=tuple(latents))
 
 
 def build_hybrid_presentation_items(
@@ -293,9 +359,15 @@ def encode_reference_prompt(
     if timeline_video_assets is not None:
         reference_items.append(dict(timeline_video_assets.item))
     if reference_audio_assets is not None:
-        from .reference_audio import reference_audio_item
+        from .reference_audio import (
+            reference_audio_asset_items,
+            reference_audio_item,
+        )
 
-        reference_items.append(reference_audio_item())
+        reference_items.extend(
+            reference_audio_item()
+            for _ in reference_audio_asset_items(reference_audio_assets)
+        )
     presentation_items = build_hybrid_presentation_items(
         reference_items,
         first_image=first_image,
@@ -321,9 +393,15 @@ def encode_reference_prompt(
     if timeline_video_assets is not None:
         refs.append(dict(timeline_video_assets.block))
     if reference_audio_assets is not None:
-        from .reference_audio import reference_audio_block
+        from .reference_audio import (
+            reference_audio_asset_items,
+            reference_audio_block,
+        )
 
-        refs.append(reference_audio_block(reference_audio_assets))
+        refs.extend(
+            dict(reference_audio_block(item))
+            for item in reference_audio_asset_items(reference_audio_assets)
+        )
     return [
         [tensor, {**dict(metadata), "minimax_refs": list(refs)}]
         for tensor, metadata in conditioning

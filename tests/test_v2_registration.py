@@ -2,16 +2,11 @@ from ComfyUI_H3_Continuum_Join.constants import (
     PROMPT_FORMAT_OPTIONS,
     SEAM_CORRECTION_AUTO,
 )
-from ComfyUI_H3_Continuum_Join.nodes import NODE_CLASS_MAPPINGS
+from ComfyUI_H3_Continuum_Join.v2.nodes import NODE_CLASS_MAPPINGS
 
 
-def test_v2_nodes_are_registered_without_removing_v1():
+def test_v2_nodes_remain_available_in_the_internal_module():
     expected = {
-        "H3ContinuumJoin",
-        "H3ContinuumFinish",
-        "H3ContinuumAssemble",
-        "H3ContinuumSaveState",
-        "H3ContinuumLoadState",
         "H3ContinuumSamplerV2",
         "H3ContinuumPromptPlanPreview",
         "H3ContinuumSaveSession",

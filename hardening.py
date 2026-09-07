@@ -466,7 +466,8 @@ def format_memory_snapshot(label: str, *values: Any) -> str:
     cuda_reserved: int | None = None
     cuda_free: int | None = None
     try:
-        if torch.cuda.is_available():
+        # Reading diagnostics must not initialize CUDA in an otherwise CPU run.
+        if torch.cuda.is_initialized():
             cuda_allocated = int(torch.cuda.memory_allocated())
             cuda_reserved = int(torch.cuda.memory_reserved())
             cuda_free = int(torch.cuda.mem_get_info()[0])

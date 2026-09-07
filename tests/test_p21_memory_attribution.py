@@ -581,5 +581,5 @@ def test_v35_assembler_is_registered_without_replacing_v34():
         H3ContinuumAssembleSeamV35
     )
     assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumAssembleSeamV35"] == (
-        "H3 Continuum Assemble + Seam V3.5"
+        "H3 Continuum Finalize"
     )

@@ -61,6 +61,105 @@ def _validate_regenerate_storage(run_storage: str, regenerate_from: int) -> None
         )
 
 
+_PARTIAL_REVIEW_SECOND_PASS_WARNING = (
+    "Warning: Review is incomplete. Second Pass refinement of a partial review "
+    "sequence is not yet supported."
+)
+
+
+def _partial_review_warning(storage, *, capture_refine_context: bool) -> str:
+    execution = getattr(storage, "review_execution", None)
+    if (
+        bool(capture_refine_context)
+        and execution is not None
+        and bool(getattr(execution, "partial_review", False))
+    ):
+        return _PARTIAL_REVIEW_SECOND_PASS_WARNING
+    return ""
+
+
+def _format_review_status(storage, *, detailed: bool = False) -> str:
+    """Format Phase D facts after finalize without reading storage in frontend."""
+
+    execution = getattr(storage, "review_execution", None)
+    if execution is None:
+        return ""
+    if getattr(storage, "review_generation_mode", None) != "Review Each Chunk":
+        return str(getattr(execution, "status_hint", "")).strip()
+
+    manifest = getattr(storage, "manifest", None)
+    contract = getattr(storage, "contract", None)
+    if not isinstance(manifest, dict) or not isinstance(contract, dict):
+        return str(getattr(execution, "status_hint", "")).strip()
+    total = int(contract.get("chunk_count", 0))
+    completed = len(list(manifest.get("chunks") or []))
+    unit = manifest.get("review_unit")
+    if not isinstance(unit, dict):
+        unit = None
+
+    if bool(getattr(execution, "finish_remaining", False)):
+        return "\n".join(
+            (
+                "Review completed",
+                (
+                    f"{int(getattr(storage, 'reused_count', 0))} reused; "
+                    f"{int(getattr(storage, 'generated_count', 0))} generated; "
+                    f"{total} total"
+                ),
+                "Sequence complete",
+            )
+        )
+
+    if unit is None:
+        if completed >= total > 0:
+            return "Review Mode\nSequence complete"
+        return str(getattr(execution, "status_hint", "")).strip()
+
+    start = int(unit.get("start", 0))
+    end = int(unit.get("end", 0))
+    terminal = start != end
+    if bool(getattr(execution, "smart_regenerate", False)):
+        regenerated = (
+            f"Chunk {start} regenerated"
+            if not terminal
+            else f"Chunks {start}-{end} regenerated"
+        )
+        lines = ["Smart Regenerate", regenerated]
+        if start > 1:
+            lines.append(f"Preserved: Chunks 1-{start - 1}")
+        if terminal:
+            lines.append("Terminal Merge: 1 physical review unit")
+        if detailed:
+            variation = getattr(execution, "requested_effective_nonce", None)
+            if variation is not None:
+                lines.append(f"Variation: {int(variation)}")
+        lines.append("Ready for review")
+        if completed >= total > 0:
+            lines.append("Sequence complete")
+        return "\n".join(lines)
+
+    ready = (
+        f"Chunk {start} / {total} ready"
+        if not terminal
+        else f"Chunks {start}-{end} / {total} ready"
+    )
+    lines = ["Review Mode", ready]
+    if terminal:
+        lines.append("Terminal Merge: 1 physical review unit")
+    if completed > 0:
+        lines.append(f"Completed: Chunks 1-{completed}")
+    if completed >= total > 0:
+        lines.append("Sequence complete")
+    else:
+        lines.extend(
+            (
+                "Next: Queue again = Accept + Continue",
+                "Options: Regenerate Current / Finish Remaining",
+            )
+        )
+    return "\n".join(lines)
+
+
 class H3ContinuumAdvancedV3:
     DESCRIPTION = (
         "Optional continuation, session, reroll, and diagnostics settings for V3."
@@ -273,7 +372,9 @@ class H3ContinuumSamplerV3:
         capture_refine_context=False,
         memory_attribution=False,
         prompt_conditioning_cache=False,
+        reference_encode_cache=False,
         continuation_transport="reference_context_v1",
+        max_new_physical_groups=None,
     ):
         if prompt_overrides is not None and not isinstance(prompt_overrides, dict):
             prompt_overrides = None
@@ -292,6 +393,7 @@ class H3ContinuumSamplerV3:
             "session": None,
             "initial_state": None,
             "prompt_plan": None,
+            "_diagnostic_continuation_policy": None,
         }
         if advanced:
             advanced_values.update(advanced)
@@ -357,7 +459,12 @@ class H3ContinuumSamplerV3:
             capture_refine_context=bool(capture_refine_context),
             memory_attribution=bool(memory_attribution),
             prompt_conditioning_cache=bool(prompt_conditioning_cache),
+            reference_encode_cache=bool(reference_encode_cache),
             continuation_transport=str(continuation_transport),
+            max_new_physical_groups=max_new_physical_groups,
+            _diagnostic_continuation_policy=advanced_values[
+                "_diagnostic_continuation_policy"
+            ],
             **clip_prompt_inputs,
         )
         if bool(capture_refine_context):
@@ -368,13 +475,16 @@ class H3ContinuumSamplerV3:
         from ..v2.sequence import _terminal_flf_merge_enabled
         from .plan import prepare_physical_decode_entries
 
-        terminal_merged = _terminal_flf_merge_enabled(
+        configured_chunks = int(chunks)
+        completed_chunks = len(entries)
+        sequence_complete = completed_chunks == configured_chunks
+        terminal_merged = sequence_complete and _terminal_flf_merge_enabled(
             multi_chunk_flf=(
                 first_frame is not None
                 and advanced_values["last_frame"] is not None
-                and len(entries) > 1
+                and configured_chunks > 1
             ),
-            chunks=len(entries),
+            chunks=configured_chunks,
             chunk_seconds=float(chunk_seconds),
             prompt_hashes=[str(entry["prompt_hash"]) for entry in entries],
             timeline_video_source=timeline_video_source,
@@ -382,7 +492,9 @@ class H3ContinuumSamplerV3:
         decode_entries, assembly_plan = prepare_physical_decode_entries(
             entries,
             chunk_seconds=float(chunk_seconds),
-            preserve_final_frame=advanced_values["last_frame"] is not None,
+            preserve_final_frame=(
+                sequence_complete and advanced_values["last_frame"] is not None
+            ),
             terminal_merged=terminal_merged,
         )
         video_latents = [{"samples": entry["video"]} for entry in decode_entries]
@@ -437,8 +549,22 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
         advanced = {"advanced": True}
         return {
             "required": {
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
+                "model": (
+                    "MODEL",
+                    {
+                        "tooltip": (
+                            "MiniMax H3 diffusion model used for every Continuum chunk."
+                        )
+                    },
+                ),
+                "clip": (
+                    "CLIP",
+                    {
+                        "tooltip": (
+                            "MiniMax H3 text encoder used to encode the complete Sequence Prompt."
+                        )
+                    },
+                ),
                 "video_vae": (
                     "VAE",
                     {
@@ -448,8 +574,22 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                         ),
                     },
                 ),
-                "sampler": ("SAMPLER",),
-                "sigmas": ("SIGMAS",),
+                "sampler": (
+                    "SAMPLER",
+                    {
+                        "tooltip": (
+                            "ComfyUI sampler algorithm used unchanged for every generated chunk."
+                        )
+                    },
+                ),
+                "sigmas": (
+                    "SIGMAS",
+                    {
+                        "tooltip": (
+                            "ComfyUI noise schedule used unchanged for every generated chunk."
+                        )
+                    },
+                ),
                 "sequence_prompt": (
                     "STRING",
                     {
@@ -543,6 +683,7 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                         "default": DIAGNOSTICS_OPTIONS[0],
                         "display_name": "Report Detail",
                         "advanced": True,
+                        "tooltip": "Controls the detail level of the read-only Status report. It does not change generated tensors.",
                     },
                 ),
                 "reroll_from_chunk": (
@@ -575,15 +716,27 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                 ),
                 "strict_compatibility": (
                     "BOOLEAN",
-                    {"default": True, "advanced": True},
+                    {
+                        "default": True,
+                        "advanced": True,
+                        "tooltip": "Legacy saved-workflow input. V3.8 keeps it loadable but ignores its value.",
+                    },
                 ),
                 "debug": (
                     "BOOLEAN",
-                    {"default": False, "advanced": True},
+                    {
+                        "default": False,
+                        "advanced": True,
+                        "tooltip": "Developer diagnostics controlled by the H3 Continuum settings panel.",
+                    },
                 ),
                 "show_preview": (
                     "BOOLEAN",
-                    {"default": True, "advanced": True},
+                    {
+                        "default": True,
+                        "advanced": True,
+                        "tooltip": "Show live sampling previews. Disable only to reduce preview overhead.",
+                    },
                 ),
                 "run_storage": (
                     ("Off", "Save + Auto Resume"),
@@ -625,14 +778,38 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
             "optional": {
                 "first_frame": (
                     "IMAGE",
-                    {"tooltip": "Optional. Leave all image inputs disconnected for T2VA."},
+                    {
+                        "tooltip": (
+                            "First Image conditioning for I2VA or FL2VA. With Output Size = "
+                            "First Image, its aspect ratio also defines the output canvas. Leave "
+                            "it disconnected and use Manual Width/Height for T2VA."
+                        )
+                    },
                 ),
-                "last_frame": ("IMAGE",),
-                "reference_image_1": ("IMAGE",),
-                "reference_image_2": ("IMAGE",),
-                "reference_image_3": ("IMAGE",),
-                "reference_audio_1": ("AUDIO",),
-                "reference_audio_vae": ("VAE",),
+                "last_frame": (
+                    "IMAGE",
+                    {"tooltip": "Optional last-frame anchor for FL2VA. Leave disconnected for T2VA and normal I2VA."},
+                ),
+                "reference_image_1": (
+                    "IMAGE",
+                    {"tooltip": "Optional Reference Image 1 for appearance, identity, subject, or scene guidance."},
+                ),
+                "reference_image_2": (
+                    "IMAGE",
+                    {"tooltip": "Optional Reference Image 2. Prompt references follow the connected image order."},
+                ),
+                "reference_image_3": (
+                    "IMAGE",
+                    {"tooltip": "Optional Reference Image 3. Prompt references follow the connected image order."},
+                ),
+                "reference_audio_1": (
+                    "AUDIO",
+                    {"tooltip": "Legacy optional single Reference Audio. Do not connect it together with Audio References."},
+                ),
+                "reference_audio_vae": (
+                    "VAE",
+                    {"tooltip": "Audio VAE used only by the legacy single Reference Audio input."},
+                ),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -684,15 +861,36 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
         capture_refine_context=False,
         memory_attribution=False,
         prompt_conditioning_cache=False,
+        reference_encode_cache=False,
         continuation_transport="reference_context_v1",
+        max_new_physical_groups=None,
+        generation_mode=None,
+        review_action=None,
+        take_group=0,
+        take_revision_id="",
+        take_action="Automatic",
+        _diagnostic_continuation_policy=None,
+        audio_references=None,
     ):
         runtime_started_at = time.perf_counter()
         from ..reference import prepare_reference_assets
-        from ..reference_audio import prepare_reference_audio_source
+        from ..reference_audio import resolve_reference_audio_input
         regenerate_from = _regenerate_from_value(
             reroll_from_chunk,
             chunks=int(chunks),
         )
+        review_requested = generation_mode is not None or review_action is not None
+        take_requested = str(take_action) != "Automatic"
+        if review_requested and (generation_mode is None or review_action is None):
+            raise ValueError(
+                "internal review execution requires both generation_mode and review_action"
+            )
+        if review_requested and max_new_physical_groups is not None:
+            raise ValueError(
+                "internal review execution owns max_new_physical_groups"
+            )
+        if take_requested and generation_mode != "Review Each Chunk":
+            raise ValueError("Take selection requires Review Each Chunk")
         reference_assets = prepare_reference_assets(
             reference_image_1=reference_image_1,
             reference_image_2=reference_image_2,
@@ -701,9 +899,10 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
             size_mode=reference_size,
             reference_image_3=reference_image_3,
         )
-        reference_audio_source = prepare_reference_audio_source(
+        reference_audio_source, resolved_reference_audio_vae = resolve_reference_audio_input(
             reference_audio_1,
             reference_audio_vae,
+            audio_references,
         )
         def mark_runtime_start(assembly_plan):
             marked = dict(assembly_plan)
@@ -729,7 +928,7 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                 prompt_overrides=prompt_overrides,
                 reference_assets=reference_assets,
                 reference_audio_source=reference_audio_source,
-                reference_audio_vae=reference_audio_vae,
+                reference_audio_vae=resolved_reference_audio_vae,
                 driving_audio_source=driving_audio_source,
                 driving_audio_vae=driving_audio_vae,
                 reference_video_source=reference_video_source,
@@ -738,7 +937,9 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                 capture_refine_context=bool(capture_refine_context),
                 memory_attribution=bool(memory_attribution),
                 prompt_conditioning_cache=bool(prompt_conditioning_cache),
+                reference_encode_cache=bool(reference_encode_cache),
                 continuation_transport=str(continuation_transport),
+                max_new_physical_groups=max_new_physical_groups,
                 advanced={
                     "audio_continuity": bool(audio_continuity),
                     "diagnostics": diagnostics,
@@ -748,10 +949,22 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
                     "debug": bool(debug),
                     "show_preview": bool(show_preview),
                     "last_frame": last_frame,
+                    "_diagnostic_continuation_policy": _diagnostic_continuation_policy,
                 },
             )
 
         if run_storage == "Off":
+            if take_requested:
+                raise ValueError(
+                    "Use This Take / Continue From Here requires Run Storage = Save + Auto Resume."
+                )
+            if review_requested:
+                from .review_control import GENERATION_MODE_REVIEW
+
+                if generation_mode == GENERATION_MODE_REVIEW:
+                    raise ValueError(
+                        "Review Each Chunk requires Run Storage = Save + Auto Resume."
+                    )
             _validate_regenerate_storage(run_storage, regenerate_from)
             execute_outputs = execute()
             if bool(capture_refine_context):
@@ -782,6 +995,15 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
         with run_storage_scope(
             storage_name, prompt=prompt, unique_id=unique_id
         ) as storage:
+            if review_requested:
+                storage.configure_review(
+                    generation_mode=str(generation_mode),
+                    review_action=str(review_action),
+                    manual_regenerate_from=regenerate_from,
+                    take_group=int(take_group),
+                    take_revision_id=str(take_revision_id),
+                    take_action=str(take_action),
+                )
             execute_outputs = execute()
             if bool(capture_refine_context):
                 video_latents, audio_latents, assembly_plan, result, refine_context = execute_outputs
@@ -791,8 +1013,25 @@ class H3ContinuumSamplerProduction(H3ContinuumSamplerV3):
             report = str(result["report"]) + "\n" + storage.summary(
                 detailed=diagnostics == DIAGNOSTICS_FULL
             )
+            warning = _partial_review_warning(
+                storage,
+                capture_refine_context=bool(capture_refine_context),
+            )
+            if warning:
+                report += "\n" + warning
             result["report"] = report
-            storage.finalize(session=result["session"], report=report)
+            storage.finalize(
+                session=result["session"],
+                report=report,
+                review_pause_metadata=storage.review_pause_metadata(),
+            )
+            review_status = _format_review_status(
+                storage,
+                detailed=diagnostics == DIAGNOSTICS_FULL,
+            )
+            if review_status:
+                report += "\n" + review_status
+            result["report"] = report
             outputs = (
                 video_latents,
                 audio_latents,

@@ -256,7 +256,10 @@ def encode_prompt_conditioning(
         images.append(last_image)
     tokenize_options = {"images": images}
     if reference_audio_assets is not None or timeline_video_assets is not None:
-        from ..reference_audio import reference_audio_item
+        from ..reference_audio import (
+            reference_audio_asset_items,
+            reference_audio_item,
+        )
 
         ref_items = [
             *({"type": "image", "data": image} for image in images),
@@ -264,7 +267,10 @@ def encode_prompt_conditioning(
         if timeline_video_assets is not None:
             ref_items.append(dict(timeline_video_assets.item))
         if reference_audio_assets is not None:
-            ref_items.append(reference_audio_item())
+            ref_items.extend(
+                reference_audio_item()
+                for _ in reference_audio_asset_items(reference_audio_assets)
+            )
         tokenize_options = {
             "minimax_ref_items": ref_items
         }
@@ -276,9 +282,12 @@ def encode_prompt_conditioning(
     if timeline_video_assets is not None:
         refs.append(dict(timeline_video_assets.block))
     if reference_audio_assets is not None:
-        from ..reference_audio import reference_audio_block
+        from ..reference_audio import reference_audio_asset_items, reference_audio_block
 
-        refs.append(dict(reference_audio_block(reference_audio_assets)))
+        refs.extend(
+            dict(reference_audio_block(item))
+            for item in reference_audio_asset_items(reference_audio_assets)
+        )
     return [
         [tensor, {**dict(metadata), "minimax_refs": list(refs)}]
         for tensor, metadata in conditioning

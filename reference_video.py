@@ -61,7 +61,7 @@ def _round_canvas(value: float) -> int:
     )
 
 
-def _resolved_size(
+def resolve_reference_video_size(
     source_width: int,
     source_height: int,
     *,
@@ -90,6 +90,10 @@ def _resolved_size(
             max(_CANVAS_MULTIPLE, (int(source_height) // _CANVAS_MULTIPLE) * _CANVAS_MULTIPLE),
         )
     return target_width, target_height
+
+
+# Preserve the established private helper for existing internal callers/tests.
+_resolved_size = resolve_reference_video_size
 
 
 @dataclass(frozen=True)
@@ -128,7 +132,12 @@ class ReferenceVideoAssets:
     block: dict[str, Any]
 
 
-def _resolve_reference_frame_count(source_frames: int, target_frames: int) -> int:
+def resolve_reference_video_frame_count(
+    source_frames: int,
+    target_frames: int,
+) -> int:
+    """Resolve the used Video Guide frame count without touching frame data."""
+
     source_count = int(source_frames)
     target_count = int(target_frames)
     if source_count < 5 or target_count < 5:
@@ -136,6 +145,10 @@ def _resolve_reference_frame_count(source_frames: int, target_frames: int) -> in
     target_cap = align_frame_count_up(target_count)
     available_count = min(source_count, target_cap)
     return min(align_frame_count_up(available_count), target_cap)
+
+
+# Preserve the established private name while exposing one shared pure resolver.
+_resolve_reference_frame_count = resolve_reference_video_frame_count
 
 
 def _fit_reference_frames(frames: torch.Tensor, frame_count: int) -> torch.Tensor:
@@ -204,7 +217,7 @@ def prepare_reference_video_source(
         )
     if int(reference_video_1.shape[-1]) < 3:
         raise ReferenceVideoError("Video Reference must contain RGB channels")
-    frame_count = _resolve_reference_frame_count(
+    frame_count = resolve_reference_video_frame_count(
         int(reference_video_1.shape[0]),
         int(target_frames),
     )
@@ -217,7 +230,7 @@ def prepare_reference_video_source(
         if str(size_mode) in REFERENCE_VIDEO_SIZE_OPTIONS
         else REFERENCE_VIDEO_SIZE_EFFICIENT
     )
-    target_width, target_height = _resolved_size(
+    target_width, target_height = resolve_reference_video_size(
         int(source_shape[2]),
         int(source_shape[1]),
         output_width=int(output_width),
@@ -249,10 +262,9 @@ def prepare_reference_video_source(
     )
 
 
-def encode_reference_video(
-    video_vae: Any,
+def _prepare_reference_video_encode_input(
     source: ReferenceVideoSource,
-) -> ReferenceVideoAssets:
+) -> tuple[torch.Tensor, dict[str, Any]]:
     available_count = min(int(source.frames.shape[0]), int(source.frame_count))
     frames = source.frames[:available_count]
     if (
@@ -273,16 +285,20 @@ def encode_reference_video(
             "disabled",
         ).movedim(1, -1).contiguous()
     frames = _fit_reference_frames(frames, source.frame_count)
-    try:
-        latent = video_vae.encode(frames).detach().to("cpu").contiguous()
-    except Exception as exc:
-        raise ReferenceVideoError("Video Reference VAE Encode failed") from exc
     qwen_frames = frames[::_SOURCE_FPS // 2].contiguous()
     item = {
         "type": "video",
         "data": qwen_frames,
         "timestamps": [index / 2.0 for index in range(int(qwen_frames.shape[0]))],
     }
+    return frames, item
+
+
+def _build_reference_video_assets(
+    source: ReferenceVideoSource,
+    item: dict[str, Any],
+    latent: torch.Tensor,
+) -> ReferenceVideoAssets:
     block = {
         "kind": "video",
         "latent_t": int(latent.shape[2]),
@@ -293,6 +309,49 @@ def encode_reference_video(
         "audio_latent": None,
     }
     return ReferenceVideoAssets(source=source, item=item, block=block)
+
+
+def encode_reference_video(
+    video_vae: Any,
+    source: ReferenceVideoSource,
+) -> ReferenceVideoAssets:
+    frames, item = _prepare_reference_video_encode_input(source)
+    try:
+        latent = video_vae.encode(frames).detach().to("cpu").contiguous()
+    except Exception as exc:
+        raise ReferenceVideoError("Video Reference VAE Encode failed") from exc
+    return _build_reference_video_assets(source, item, latent)
+
+
+def encode_reference_video_cached(
+    video_vae: Any,
+    source: ReferenceVideoSource,
+    *,
+    cache_event=None,
+) -> ReferenceVideoAssets:
+    """Encode only the V3.8 Video Guide latent through the shared cache."""
+
+    from .v3.ref_encode_cache import (
+        get_ref_encode_cache,
+        make_ref_encode_cache_key,
+    )
+
+    frames, item = _prepare_reference_video_encode_input(source)
+    cache = get_ref_encode_cache()
+    key = make_ref_encode_cache_key(
+        "video_guide",
+        REFERENCE_VIDEO_PREPROCESS_VERSION,
+        source.combined_hash,
+    )
+    latent = cache.lookup(video_vae, key, event_sink=cache_event)
+    if latent is None:
+        try:
+            latent = video_vae.encode(frames).detach().to("cpu").contiguous()
+        except Exception as exc:
+            raise ReferenceVideoError("Video Reference VAE Encode failed") from exc
+        if cache.supports_vae(video_vae):
+            cache.store(video_vae, key, latent, event_sink=cache_event)
+    return _build_reference_video_assets(source, item, latent)
 
 
 def combine_reference_video_identity(

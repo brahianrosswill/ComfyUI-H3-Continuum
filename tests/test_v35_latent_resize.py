@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ComfyUI_H3_Continuum_Join.nodes import NODE_CLASS_MAPPINGS
+from ComfyUI_H3_Continuum_Join.v3.latent_resize_nodes import NODE_CLASS_MAPPINGS
 from ComfyUI_H3_Continuum_Join.v3.latent_resize_nodes import (
     H3ContinuumLatentResizeV35,
     UPSCALE_METHODS,

@@ -6,9 +6,15 @@ import types
 import pytest
 import torch
 
-from ComfyUI_H3_Continuum_Join.nodes import (
+from ComfyUI_H3_Continuum_Join.v3.hires_fix_nodes import (
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
+)
+from ComfyUI_H3_Continuum_Join.v3.second_pass_nodes import (
+    NODE_DISPLAY_NAME_MAPPINGS as SECOND_PASS_DISPLAY_NAME_MAPPINGS,
+)
+from ComfyUI_H3_Continuum_Join.v3.latent_resize_nodes import (
+    NODE_DISPLAY_NAME_MAPPINGS as LATENT_RESIZE_DISPLAY_NAME_MAPPINGS,
 )
 from ComfyUI_H3_Continuum_Join.v3.hires_fix_nodes import (
     H3ContinuumHiResFixV35,
@@ -511,10 +517,10 @@ def test_three_v35_nodes_are_registered_with_final_display_names():
     assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumHiResFixV35"] == (
         "H3 Continuum Hi-Res Fix V3.5"
     )
-    assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumSecondPassV35"] == (
-        "H3 Continuum Second Pass V3.5"
+    assert SECOND_PASS_DISPLAY_NAME_MAPPINGS["H3ContinuumSecondPassV35"] == (
+        "H3 Continuum Second Pass"
     )
-    assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumLatentResizeV35"] == (
+    assert LATENT_RESIZE_DISPLAY_NAME_MAPPINGS["H3ContinuumLatentResizeV35"] == (
         "H3 Continuum Latent Resize V3.5"
     )
     assert H3ContinuumHiResFixV35.INPUT_IS_LIST is True

@@ -326,7 +326,10 @@ class H3ContinuumSamplerV2:
         capture_refine_context=False,
         memory_attribution=False,
         prompt_conditioning_cache=False,
+        reference_encode_cache=False,
         continuation_transport="reference_context_v1",
+        max_new_physical_groups=None,
+        _diagnostic_continuation_policy=None,
         **clip_prompt_inputs,
     ):
         (
@@ -403,7 +406,10 @@ class H3ContinuumSamplerV2:
             capture_refine_context=bool(capture_refine_context),
             memory_attribution=bool(memory_attribution),
             prompt_conditioning_cache=bool(prompt_conditioning_cache),
+            reference_encode_cache=bool(reference_encode_cache),
             continuation_transport=str(continuation_transport),
+            max_new_physical_groups=max_new_physical_groups,
+            _diagnostic_continuation_policy=_diagnostic_continuation_policy,
         )
 
 

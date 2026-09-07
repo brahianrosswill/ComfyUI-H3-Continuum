@@ -53,6 +53,13 @@ def _latent_samples(value: Any, *, name: str) -> torch.Tensor:
     return samples
 
 
+def _require_finite_samples(samples: torch.Tensor, *, name: str) -> None:
+    """Reject unusable processor output before it reaches Second Pass Sampling."""
+
+    if not bool(torch.isfinite(samples).all().item()):
+        raise SecondPassContractError(f"{name}.samples contains NaN or Inf")
+
+
 def _contract_groups(assembly_plan: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if not isinstance(assembly_plan, Mapping):
         raise SecondPassContractError("assembly_plan must be a mapping")
@@ -95,6 +102,7 @@ def _validate_video_groups(
         source_w = int(group.get("source_latent_w", -1))
         if source_h < 1 or source_w < 1 or height < source_h or width < source_w:
             raise SecondPassContractError("video latent spatial size must be preserved or enlarged")
+        _require_finite_samples(samples, name=f"video_latents[{position}]")
         if target_geometry is None:
             target_geometry = (height, width)
         elif target_geometry != (height, width):
@@ -121,6 +129,7 @@ def validate_second_pass_inputs(
         expected_shape = group.get("source_audio_shape")
         if not isinstance(expected_shape, list) or tuple(expected_shape) != tuple(samples.shape):
             raise SecondPassContractError("audio latent shape or physical group order changed")
+        _require_finite_samples(samples, name=f"audio_latents[{position}]")
 
     return {
         "physical_group_count": len(groups),
@@ -133,6 +142,38 @@ def validate_second_pass_inputs(
 def passthrough_audio_latents(audio_latents: Sequence[Any]) -> list[Any]:
     """Return original LATENT objects; temporary refined audio is not adopted in V1."""
     return list(audio_latents)
+
+
+def _normalize_selected_group_indices(
+    selected_group_indices: Sequence[int] | None,
+    physical_group_count: int,
+) -> tuple[tuple[int, ...], bool]:
+    """Validate an optional internal physical-group selection."""
+
+    if selected_group_indices is None:
+        return tuple(range(physical_group_count)), False
+    if (
+        not isinstance(selected_group_indices, Sequence)
+        or isinstance(selected_group_indices, (str, bytes))
+        or not selected_group_indices
+    ):
+        raise SecondPassContractError(
+            "selected physical groups must be a non-empty integer sequence"
+        )
+    selected = tuple(selected_group_indices)
+    if any(type(index) is not int for index in selected):
+        raise SecondPassContractError(
+            "selected physical group indices must be integers"
+        )
+    if len(set(selected)) != len(selected):
+        raise SecondPassContractError("selected physical groups contain duplicates")
+    if tuple(sorted(selected)) != selected:
+        raise SecondPassContractError(
+            "selected physical groups must follow physical execution order"
+        )
+    if selected[0] < 0 or selected[-1] >= physical_group_count:
+        raise SecondPassContractError("selected physical group index is out of range")
+    return selected, True
 
 
 def update_second_pass_geometry(
@@ -189,6 +230,7 @@ def prepare_physical_refine_groups(
     adapt_group_conditioning_fn=None,
     group_consumer_fn=None,
     retain_group_outputs: bool = True,
+    selected_group_indices: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Prepare one MODEL and one complete CONDITIONING per physical group.
 
@@ -202,6 +244,11 @@ def prepare_physical_refine_groups(
         video_latents,
         assembly_plan,
     )
+    selected_indices, selection_active = _normalize_selected_group_indices(
+        selected_group_indices,
+        len(groups),
+    )
+    selected_index_set = set(selected_indices)
     encode_prompt_fn = encode_prompt_fn or encode_prompt_conditioning
     clone_model_fn = clone_model_fn or clone_model_for_chunk
     validate_refine_context_fn = validate_refine_context_fn or validate_refine_context
@@ -248,6 +295,8 @@ def prepare_physical_refine_groups(
     group_conditioning: list[list[Any]] = []
     details: list[dict[str, Any]] = []
     for group_index, group in enumerate(groups):
+        if group_index not in selected_index_set:
+            continue
         captured_group = (
             captured_groups[group_index] if captured_groups is not None else None
         )
@@ -344,11 +393,12 @@ def prepare_physical_refine_groups(
         details.append(detail)
 
     physical_group_count = len(groups)
+    selected_group_count = len(selected_indices)
     if retain_group_outputs and not (
         len(group_models)
         == len(group_conditioning)
         == len(details)
-        == physical_group_count
+        == selected_group_count
     ):
         raise SecondPassContractError(
             "prepared MODEL/CONDITIONING physical group counts differ"
@@ -367,6 +417,9 @@ def prepare_physical_refine_groups(
         "details": details,
         "warnings": warnings,
         "physical_group_count": physical_group_count,
+        "selected_group_count": selected_group_count,
+        "selected_group_indices": list(selected_indices),
+        "selection_active": selection_active,
         "target_latent_h": target_h,
         "target_latent_w": target_w,
     }
@@ -394,6 +447,8 @@ def run_second_pass_groups(
     validate_refine_context_fn=None,
     adapt_group_conditioning_fn=None,
     refine_schedule: RefineSchedule | None = None,
+    selected_group_indices: Sequence[int] | None = None,
+    temporal_windows_by_group: Mapping[int, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[Any], dict[str, Any], str]:
     """Refine complete physical groups while preserving first-pass audio exactly."""
 
@@ -405,10 +460,16 @@ def run_second_pass_groups(
     effective_sigmas = resolved_schedule.sigmas
     schedule_contract = serializable_schedule_contract(resolved_schedule)
     groups = _contract_groups(assembly_plan)
+    selected_indices, selection_active = _normalize_selected_group_indices(
+        selected_group_indices,
+        len(groups),
+    )
     latent_builder = latent_builder or latent_from_cpu
     sample_fn = sample_fn or sample_refine_chunk
     stream_extractor = stream_extractor or extract_av_streams
-    refined_videos: list[dict[str, Any]] = []
+    refined_videos: list[dict[str, Any]] = (
+        list(video_latents) if selection_active else []
+    )
     group_seeds: list[int] = []
     conditioning_sources: list[str] = []
     group_report_lines: list[str] = []
@@ -432,7 +493,7 @@ def run_second_pass_groups(
         group_seeds.append(physical_seed)
         conditioning_sources.append(conditioning_source)
         nested_latent = latent_builder(video_samples, audio_samples)
-        sampled = sample_fn(
+        sample_arguments = dict(
             model=chunk_model,
             conditioning=conditioning,
             latent=nested_latent,
@@ -441,6 +502,14 @@ def run_second_pass_groups(
             seed=physical_seed,
             enable_preview=bool(enable_preview),
         )
+        if temporal_windows_by_group is not None:
+            temporal_window = temporal_windows_by_group.get(group_index)
+            if temporal_window is None:
+                raise SecondPassContractError(
+                    f"selected physical group {group_index + 1} has no temporal window"
+                )
+            sample_arguments["temporal_window"] = temporal_window
+        sampled = sample_fn(**sample_arguments)
         refined_video, _temporary_audio = stream_extractor(sampled)
         if tuple(refined_video.shape) != tuple(video_samples.shape):
             raise SecondPassContractError(
@@ -452,7 +521,10 @@ def run_second_pass_groups(
             )
         output_latent = dict(video_latent)
         output_latent["samples"] = refined_video
-        refined_videos.append(output_latent)
+        if selection_active:
+            refined_videos[group_index] = output_latent
+        else:
+            refined_videos.append(output_latent)
         group_report_lines.append(
             "group "
             f"{group_index + 1}: logical_chunks={group.get('logical_chunks')}, "
@@ -491,7 +563,12 @@ def run_second_pass_groups(
         adapt_group_conditioning_fn=adapt_group_conditioning_fn,
         group_consumer_fn=sample_prepared_group,
         retain_group_outputs=False,
+        selected_group_indices=(selected_indices if selection_active else None),
     )
+    if len(group_seeds) != len(selected_indices):
+        raise SecondPassContractError(
+            "Video refine Sampling count differs from selected physical group count"
+        )
     report_lines = [
         "H3 Continuum Second Pass V3.5",
         "Mode: context-aware physical-group refine when a complete First Pass "
@@ -509,6 +586,14 @@ def run_second_pass_groups(
         *prepared["warnings"],
         *group_report_lines,
     ]
+    if selection_active:
+        report_lines.insert(
+            3,
+            "Selected physical groups: "
+            + ", ".join(str(index + 1) for index in selected_indices)
+            + "; non-selected groups were exact object passthrough with no "
+            "conditioning, MODEL clone, Sampling, or seed derivation.",
+        )
 
     passthrough_audio = passthrough_audio_latents(audio_latents)
     updated_plan = prepared["updated_assembly_plan"]

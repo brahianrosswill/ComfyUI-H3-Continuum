@@ -159,11 +159,15 @@ def _wrapper_factory(
     strict: bool,
     debug: bool,
     validation_profiler: LayoutValidationProfiler | None = None,
+    packed_row_planner: Any = None,
 ) -> Callable[..., Any]:
     branch_baselines: dict[tuple[Any, ...], tuple[Any, ...]] = {}
 
     def apply_model_wrapper(executor, *args, **kwargs):
         payload = kwargs.get("minimax_payload")
+        if packed_row_planner is not None:
+            from .v3.packed_row_planner import observe_layout_fail_soft
+            observe_layout_fail_soft(packed_row_planner, payload)
         has_continuum = payload_has_continuum(payload)
         has_mixed_keyframe_refs = (
             isinstance(payload, dict)
@@ -233,6 +237,7 @@ def configure_continuum_model(
     strict: bool,
     debug: bool,
     validation_profiler: LayoutValidationProfiler | None = None,
+    packed_row_planner: Any = None,
 ):
     try:
         from comfy.patcher_extension import WrappersMP
@@ -264,6 +269,7 @@ def configure_continuum_model(
             strict=bool(strict),
             debug=bool(debug),
             validation_profiler=validation_profiler,
+            packed_row_planner=packed_row_planner,
         ),
     )
     model_options = dict(getattr(patched, "model_options", None) or {})
@@ -279,6 +285,7 @@ def patch_model(
     strict: bool,
     debug: bool,
     validation_profiler: LayoutValidationProfiler | None = None,
+    packed_row_planner: Any = None,
 ):
     """Clone once, then install the Continuum wrapper on that clone."""
     if not hasattr(model, "clone"):
@@ -290,6 +297,7 @@ def patch_model(
         strict=strict,
         debug=debug,
         validation_profiler=validation_profiler,
+        packed_row_planner=packed_row_planner,
     )
 
 def continuum_interop_request(*, chunk_index: int, context_frames: int) -> dict[str, Any]:
@@ -310,6 +318,7 @@ def clone_model_for_chunk(
     chunk_index: int,
     context_frames: int | None,
     validation_profiler: LayoutValidationProfiler | None = None,
+    packed_row_planner: Any = None,
 ):
     """Create a call-local MODEL and attach an optional read-only Spectrum hint."""
     if not hasattr(model, "clone"):
@@ -322,6 +331,7 @@ def clone_model_for_chunk(
         strict=bool(strict),
         debug=bool(debug),
         validation_profiler=validation_profiler,
+        packed_row_planner=packed_row_planner,
     )
     if debug:
         parent = getattr(chunk_model, "parent", None)

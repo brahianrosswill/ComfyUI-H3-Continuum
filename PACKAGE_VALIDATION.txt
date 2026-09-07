@@ -1,53 +1,42 @@
-ComfyUI-H3-Continuum V3.7.0 package validation
+ComfyUI-H3-Continuum V3.8 — package validation record
 
-Status: V3.7.0 release candidate. Conditioning Adapter and the internal RefineSchedule v1 are correctness-accepted without changing V3.6 Production defaults or the existing SIGMAS socket. Still Image Guide positioning, source ownership, Terminal Merge, Run Storage identity, and target-resolution reconditioning are correctness-accepted, but hard-anchor quality remains Experimental / Production HOLD. All V3.6/V3.5.3/V3.4 public node IDs and saved-workflow contracts remain available.
+Status: source-tree release-hygiene candidate. Release / Registry readiness remains HOLD until the separate final package-staging gate completes. This record is not a release artifact and does not authorize commit, push, tag, release, or Registry publication.
 
-Required automated checks:
-- python -m compileall -q .
-- python -m pytest -q -p no:cacheprovider
-- python tools/verify_runtime.py --comfy-root <runtime-path>
+Public surface: exactly seven nodes
+- H3 Continuum Sampler V3.8
+- H3 Continuum Reference Audios
+- H3 Continuum Finalize
+- H3 Continuum Load Image
+- H3 Continuum Load Audio
+- H3 Continuum Load Video
+- H3 Continuum Second Pass
 
-Validated runtime paths include:
-- H3 Continuum Sampler V3.7 required-input parity with V3.6 and one optional Still Image Guide input
-- Conditioning Adapter reconstruction of First/Last, continuation context, and owned Still Guide sources at target geometry
-- RefineSchedule v1 External / Full / Tail / Partial contracts with exact source schedule slicing
-- Internal Tail 6 at 704x704: six evaluations, decoded Video SSIM 0.982936 versus the external Tail 6 baseline, and bit-exact decoded Audio PCM
-- 1152x1152 Still Guide source reconditioning correctness with first-pass Audio passthrough preserved
-- Still Guide single-IMAGE validation and explicit source-role priority at First/Last endpoint collisions
-- V3.7 compact frontend parity for project identity, hidden widgets, Run Storage controls, queue normalization, diagnostics, and permanent Reference Audio sockets
-- V3.6.1 mixed Timeline/List Prompt diagnostics and fail-open normalization
-- V3.6.1 non-Balanced Audio Continuity fallback routing before Run Storage identity creation
-- V3.6.1 public-node Strong 39 / Audio Continuity fallback GPU Smoke on ComfyUI_W: 2x5 seconds, 576x576, 240 frames, 10.000-second video and audio
-- H3 Continuum Sampler V3.6 Standard / Compatibility backend mapping without exposing internal transport identifiers
-- Masked AV protected Video/Audio prefix bit-exact finalization
-- Run Storage Save, Auto Resume, and Regenerate From with backend-scoped revisions and atomic Terminal Merge reuse
-- Reference Image and Reference Audio retention in every Masked physical group
-- 3x5 FL2VA Long Terminal Merge Masked GPU acceptance and PIG-3 subjective Audio PASS
-- Shared 4.0-30.0 second chunk duration range; 5-15 seconds remains the recommended and validated range
-- V3.5 refine-context contract and Advanced Second Pass Bridge
-- Conditioning Bridge MODEL / CONDITIONING alignment per physical group without CONDITIONING-entry flattening
-- Permanent Python-defined Reference Audio sockets, workflow save/reload widget alignment, and conditioning retention
-- 1x5 T2VA, 3x5 T2VA, and 3x5 FL2VA Long Terminal Merge Second Pass GPU acceptance
-- First-pass audio LATENT object passthrough through Second Pass
-- H3 Continuum Assemble + Seam V3.5 RAM / Disk-backed output equivalence
-- Auto backend selection with RAM and 9.49 GiB disk-backed real-runtime cases
-- Exact Duration and Video Seam direct-write behavior
-- Experimental 1x5 FL2VA Pixel/VAE Hi-Res Fix GPU acceptance at 576 to 1152
-- Hybrid FL2VA + Reference 1x5 GPU acceptance through integrated 2x Hi-Res Fix and direct Advanced Second Pass
-- Production sampler and Core VAE Decode assembly
-- Reference Image 1-3
-- Driving Audio absolute-time guide conditioning with original-source final output
-- Persistent Video Guide Frames conditioning
-- Video Guide Size: Efficient 0.4 MP / Balanced 0.6 MP / Match Output
-- Run Storage save, checksum verification, and complete reuse
-- Run Storage identity coverage for Driving Audio and Video Guide Frames
-- Permissive prompt warning/fallback behavior
-- Spectrum Interop API v1 with Actual Prefix 2 on continuation chunks
-- Audio Seam Auto
-- Video Seam Auto guarded transient and micro-flash correction
+Protected contracts
+- Sampling Contract v5
+- Run Storage v3
+- State, Session, Assembly Plan, Driving Audio, and Second Pass/O1
+- Existing six public node IDs, sockets, and widget order
+- AUDIO-R1 adds only the Reference Audios helper and the Sampler's optional bundle socket
 
-Latest verified automated result: 633 passed.
+Current verified source checks (2026-09-03)
+- Full pytest: 1117 passed, 0 failed (one external pynvml deprecation warning)
+- JavaScript syntax: 7/7
+- Python compileall: PASS
+- Development and Registry manifests: regenerated from their established file lists; verification requires missing, extra, and mismatch all equal to zero
+- Historical V3.8 workflow check: one Registry workflow only; no Hi-Res Fix standard path. The final 2026-09-07 distribution uses the supplied Spectrum graph in JSON and ZIP forms instead of the former Core-only template.
+- Public workflow graph: no orphan links or required-input validation errors
+- Runtime verifier, isolated import, public export/display, and protected-contract checks are recorded by the release-hygiene result report
 
-Still Image Guide, legacy Main Hi-Res Fix, and Auto 2 remain experimental. Still Image Guide hard-anchor transition quality is not Production-accepted. Main 3x5 2x is not accepted on the tested RTX 5060 Ti 16 GiB because the terminal 77T Second Pass group exceeded VRAM; longer Reference/Hybrid acceptance remains pending.
+Registry package policy
+- Include production runtime modules, the two runtime-required tools modules, and tools/verify_runtime.py for package verification.
+- Exclude tests, runner/probe/diagnostic tools, internal state/worklog documents, development manifests, Labs assets, and historical workflows.
+- Include `examples/workflows/MiniMax_H3_Continuum_V38.json` and `examples/workflows/MiniMax_H3_Continuum_V38.zip`: one identical, user-supplied graph in two formats, not two workflow variants. Spectrum, rgthree, KJNodes, and ComfyUI-Easy-Use are external requirements, not bundled dependencies.
+- Preserve the supplied JSON and ZIP bytes, including prompt, media filenames, titles, and settings. Exclude unrelated backup ZIPs without deleting them.
+- The Development `MANIFEST.sha256` is a source integrity record and is excluded from the Registry archive. `REGISTRY_MANIFEST.sha256` must cover the actual staged archive files with zero missing, extra, or mismatched paths.
 
-Detailed evidence: docs/VALIDATION_RESULTS.md
+Required final Release Track gate (not performed by this document)
+1. Build an isolated stage by the current `.comfyignore` rules.
+2. Import only from the stage; verify all seven public nodes and production helpers.
+3. Run the official comfy-cli validate and pack commands.
+4. Re-expand the archive and prove source/stage/archive SHA parity, no internal files, and no secrets or local-path leakage.
+5. Keep Release / Registry readiness HOLD unless every gate passes.

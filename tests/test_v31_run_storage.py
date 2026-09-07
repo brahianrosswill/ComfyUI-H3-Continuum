@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import torch
 import pytest
 import ctypes
+import ComfyUI_H3_Continuum_Join.run_storage as run_storage_module
 
 from ComfyUI_H3_Continuum_Join.run_storage import (
     RunStorageController,
+    RunStorageError,
     _hash,
     _resume_session_settings,
     _apply_nonce_contract,
@@ -154,6 +156,50 @@ def test_fsync_file_accepts_a_completed_file_on_windows(tmp_path):
     target = tmp_path / "chunk.tmp"
     target.write_bytes(b"complete")
     _fsync_file(target)
+
+
+def test_json_manifest_replace_retries_transient_windows_access_denied(tmp_path, monkeypatch):
+    target = tmp_path / "manifest.json"
+    original_replace = run_storage_module.os.replace
+    calls = []
+
+    def transient_replace(source, destination):
+        calls.append((source, destination))
+        if len(calls) < 3:
+            raise PermissionError(5, "synthetic access denied", str(destination))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(run_storage_module.os, "replace", transient_replace)
+    sleeps = []
+    monkeypatch.setattr(run_storage_module.time, "sleep", sleeps.append)
+
+    run_storage_module._write_json(target, {"revision": "new"})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"revision": "new"}
+    assert len(calls) == 3
+    assert sleeps == [0.02, 0.05]
+    assert not list(tmp_path.glob(".manifest.json.*.tmp"))
+
+
+def test_json_manifest_replace_keeps_existing_manifest_after_permanent_access_denied(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "manifest.json"
+    target.write_text('{"revision": "old"}\n', encoding="utf-8")
+
+    def permanent_replace(source, destination):
+        raise PermissionError(5, "synthetic permanent access denied", str(destination))
+
+    monkeypatch.setattr(run_storage_module.os, "replace", permanent_replace)
+    monkeypatch.setattr(run_storage_module.time, "sleep", lambda _: None)
+
+    with pytest.raises(RunStorageError, match="atomic manifest replace failed") as error:
+        run_storage_module._write_json(target, {"revision": "new"})
+
+    assert "src_exists=True" in str(error.value)
+    assert "dst_exists=True" in str(error.value)
+    assert json.loads(target.read_text(encoding="utf-8")) == {"revision": "old"}
+    assert not list(tmp_path.glob(".manifest.json.*.tmp"))
 
 
 def test_chunk_sha256_rejects_same_size_corruption(tmp_path):

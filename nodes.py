@@ -382,6 +382,38 @@ from .v3.driving_nodes import (
 NODE_CLASS_MAPPINGS.update(V34_NODE_CLASS_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(V34_NODE_DISPLAY_NAME_MAPPINGS)
 
+from .v3.easy_nodes import (
+    NODE_CLASS_MAPPINGS as V38_EASY_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as V38_EASY_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(V38_EASY_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(V38_EASY_NODE_DISPLAY_NAME_MAPPINGS)
+
+from .v3.easy_image_nodes import (
+    NODE_CLASS_MAPPINGS as EASY_IMAGE_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as EASY_IMAGE_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(EASY_IMAGE_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(EASY_IMAGE_NODE_DISPLAY_NAME_MAPPINGS)
+
+from .v3.easy_audio_nodes import (
+    NODE_CLASS_MAPPINGS as EASY_AUDIO_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as EASY_AUDIO_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(EASY_AUDIO_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(EASY_AUDIO_NODE_DISPLAY_NAME_MAPPINGS)
+
+from .v3.easy_video_nodes import (
+    NODE_CLASS_MAPPINGS as EASY_VIDEO_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as EASY_VIDEO_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(EASY_VIDEO_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(EASY_VIDEO_NODE_DISPLAY_NAME_MAPPINGS)
+
 from .v3.second_pass_nodes import (
     NODE_CLASS_MAPPINGS as V35_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as V35_NODE_DISPLAY_NAME_MAPPINGS,
@@ -416,29 +448,20 @@ from .v3.hires_fix_nodes import (
 NODE_CLASS_MAPPINGS.update(V35_HIRES_FIX_NODE_CLASS_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(V35_HIRES_FIX_NODE_DISPLAY_NAME_MAPPINGS)
 
-# The stable facade and its pack helpers are the public workflow surface. Keep
-# every older identifier registered so saved workflows still load, while
-# ComfyUI's native deprecated-node filter hides legacy building blocks.
-_primary_node_ids = {
-    "H3ContinuumSamplerV34",
-    "H3ContinuumSamplerV35",
-    "H3ContinuumSamplerV36",
-    "H3ContinuumStillImageGuideV37",
-    "H3ContinuumSamplerV37",
-    "H3ContinuumAssembleSeamV34",
-    "H3ContinuumAssembleSeamV35",
-    "H3ContinuumHiResFixV35",
-    "H3ContinuumLatentResizeV35",
-    "H3ContinuumSecondPassV35",
-    "H3ContinuumConditioningBridgeV35",
-    "H3ContinuumClipOverrides",
-    "H3ContinuumResult",
+# V3.8 exports only its audited launch surface. The imports and merged mappings
+# above intentionally stay in place because the V3.8 implementation still
+# inherits and reuses historical modules internally.
+_PUBLIC_NODE_DISPLAY_NAMES = {
+    "H3ContinuumSamplerV38": "H3 Continuum Sampler V3.8",
+    "H3ContinuumReferenceAudios": "H3 Continuum Reference Audios",
+    "H3ContinuumAssembleSeamV35": "H3 Continuum Finalize",
+    "H3EasyLoadImage": "H3 Continuum Load Image",
+    "H3EasyLoadAudio": "H3 Continuum Load Audio",
+    "H3ContinuumLoadVideo": "H3 Continuum Load Video",
+    "H3ContinuumSecondPassV35": "H3 Continuum Second Pass",
 }
-for _node_id, _node_class in NODE_CLASS_MAPPINGS.items():
-    if _node_id in _primary_node_ids:
-        continue
-    _node_class.DEPRECATED = True
-    _node_class.CATEGORY = f"{CATEGORY}/Legacy"
-    _display_name = NODE_DISPLAY_NAME_MAPPINGS.get(_node_id, _node_id)
-    if not _display_name.startswith("[Legacy]"):
-        NODE_DISPLAY_NAME_MAPPINGS[_node_id] = f"[Legacy] {_display_name}"
+NODE_CLASS_MAPPINGS = {
+    node_id: NODE_CLASS_MAPPINGS[node_id]
+    for node_id in _PUBLIC_NODE_DISPLAY_NAMES
+}
+NODE_DISPLAY_NAME_MAPPINGS = dict(_PUBLIC_NODE_DISPLAY_NAMES)

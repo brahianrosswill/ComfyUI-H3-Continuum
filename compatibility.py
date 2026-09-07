@@ -184,9 +184,33 @@ def run_native_layout_self_test() -> str:
     va, _vb = target_video
     if not torch.equal(layout.position_ids[ra:rb], layout.position_ids[va : va + (rb - ra)]):
         raise CompatibilityError("layout self-test could not align video context")
+    audio_refs = [
+        {
+            "kind": "audio",
+            "ref_audio_t": length,
+            "audio_latent": torch.zeros(1, 32, 2, length),
+        }
+        for length in (2, 3, 4)
+    ]
+    audio_layout = h3_model.PackedLayout(
+        3, 7, 2, 2, 10, keyframes=None, refs=audio_refs
+    )
+    audio_segments = [
+        stop - start
+        for start, stop, kind in audio_layout.segments
+        if kind == "ref_audio"
+    ]
+    packed_audio_rows = torch.cat(
+        [h3_model.pack_audio(item["audio_latent"]) for item in audio_refs], dim=0
+    ).shape[0]
+    if audio_segments != [4, 6, 8] or sum(audio_segments) != packed_audio_rows:
+        raise CompatibilityError(
+            "layout self-test found a multi-Reference-Audio packed-row mismatch"
+        )
     return (
         f"native PackedLayout self-test passed; rows={layout.position_ids.shape[0]}, "
-        f"position_ids_id={result['position_ids_id']}"
+        f"position_ids_id={result['position_ids_id']}, "
+        f"reference_audio_rows={packed_audio_rows}"
     )
 
 def ensure_native_h3_base_model(base_model: Any) -> None:

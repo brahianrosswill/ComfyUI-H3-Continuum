@@ -36,12 +36,8 @@ def test_v36_is_registered_without_replacing_v35():
     assert NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumSamplerV36"] == (
         "H3 Continuum Sampler V3.6"
     )
-    assert root_nodes.NODE_CLASS_MAPPINGS["H3ContinuumSamplerV36"] is (
-        H3ContinuumSamplerV36
-    )
-    assert root_nodes.NODE_CLASS_MAPPINGS["H3ContinuumSamplerV35"] is (
-        H3ContinuumSamplerV35
-    )
+    assert "H3ContinuumSamplerV36" not in root_nodes.NODE_CLASS_MAPPINGS
+    assert "H3ContinuumSamplerV35" not in root_nodes.NODE_CLASS_MAPPINGS
     assert H3ContinuumSamplerV36.RETURN_TYPES == H3ContinuumSamplerV35.RETURN_TYPES
     assert H3ContinuumSamplerV36.RETURN_NAMES == H3ContinuumSamplerV35.RETURN_NAMES
 

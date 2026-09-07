@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from ComfyUI_H3_Continuum_Join.nodes import (
+from ComfyUI_H3_Continuum_Join.v3.conditioning_bridge_nodes import (
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
 )

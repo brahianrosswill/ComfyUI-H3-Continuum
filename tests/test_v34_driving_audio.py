@@ -151,12 +151,8 @@ def test_v34_public_schema_replaces_reference_audio_with_driving_audio():
 
     from ComfyUI_H3_Continuum_Join import nodes as root_nodes
 
-    assert root_nodes.NODE_DISPLAY_NAME_MAPPINGS["H3ContinuumSamplerV34"] == (
-        "H3 Continuum Sampler V3.4"
-    )
-    assert root_nodes.NODE_DISPLAY_NAME_MAPPINGS[
-        "H3ContinuumSamplerTimelineVideo"
-    ].startswith("[Legacy]")
+    assert "H3ContinuumSamplerV34" not in root_nodes.NODE_CLASS_MAPPINGS
+    assert "H3ContinuumSamplerTimelineVideo" not in root_nodes.NODE_CLASS_MAPPINGS
 
 
 def test_unused_long_audio_tail_does_not_change_contract_or_output():

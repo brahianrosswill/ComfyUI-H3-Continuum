@@ -1,6 +1,21 @@
-ComfyUI-H3-Continuum V3.7.0
+ComfyUI-H3-Continuum V3.8.0
 
 MiniMax H3の5秒ChunkをAV latent contextで継続し、長尺映像として組み立てるComfyUIカスタムノードです。
+
+V3.8.0:
+- 公開面はSampler V3.8、Finalize、Load Image、Load Audio、Load Video、Second Pass、Reference Audios helperの7ノード
+- Main Samplerへfrontend-onlyのBasic／Production表示propertyを追加。Python Schema、widget順・値、backend引数は不変
+- MainのAspect選択をSize Source（First Image／Manual）へ整理。ManualではWidth／Heightを表示し、旧Aspect値は同じcanvasへ移行
+- Draft 0.30 MP、Balanced 0.60 MP、Native 768、Custom MPのResolution Resolverを維持
+- Review Each Chunk、Continue、Regenerate Current、Finish RemainingをRun Storageへ統合
+- FL2VA Terminal Merge pairを1つのatomic review unitとして維持
+- Driving AudioをReview、Smart Regenerate、Finish Remaining、restart persistenceと併用可能
+- Image／Audio／Video Loaderはnative Bypass中もEnable行を明瞭に表示し、その場でONへ復帰可能
+- 公開WorkflowはMiniMax_H3_Continuum_V38.jsonと同じJSONを含む同名ZIP。Spectrum初期設定のgraphを変更せず配布。Spectrum、rgthree、KJNodes、ComfyUI-Easy-Useが必要
+- 16GB GPU GateはPASS。ただしVRAM headroomは小さく、Strict Minimal 14.96 GiB、複雑なGateは約15.5～15.6 GiB
+- Review途中のpartial sequenceではSecond Pass／refine_contextは正式対応外。Review完了後にSecond Passを実行
+- V3.7以前のNode IDはV3.8で非export。旧保存Workflowは対応するhistorical Release/tagを使用
+- Registry配布からtests、tools、diagnostics、Labs資産、旧Workflowを除外し、内部継承moduleは維持
 
 V3.7.0:
 - H3 Continuum Sampler V3.7と、1枚のStill Image Guide用optional入力を追加
