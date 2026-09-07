@@ -1,4 +1,7 @@
 # ComfyUI-H3-Continuum 3.8.0
+
+**Download workflow: [JSON](examples/workflows/MiniMax_H3_Continuum_V38.json) | [ZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip)** — [Latest release](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum/releases/latest)
+
 <img width="1536" height="1024" alt="exec-55ad0463-8655-409c-b9a6-49d1315cdd78" src="https://github.com/user-attachments/assets/063bb16b-5c25-44f8-9304-031995502b26" />
 
 
