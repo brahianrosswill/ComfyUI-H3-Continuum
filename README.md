@@ -2,6 +2,8 @@
 
 **Download workflow: [JSON](examples/workflows/MiniMax_H3_Continuum_V38.json) | [ZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip)** — [Latest release](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum/releases/latest)
 
+⚠️ Hotfix in progress: We’re investigating reported issues with chunk continuation and Review Each Chunk mode in V3.8. A hotfix is being prepared. Thank you for your reports and patience—we’ll update this page when it’s ready.
+
 **Review UI hotfix on `main` — September 8, 2026:** Changed settings no longer offer a stale chunk Retry. Use **Start again from Chunk 1**, then Queue, to restart with the current settings while keeping saved Takes. The restart selection is consumed once so the next Queue can continue normally. Update with the `git pull` command below, restart ComfyUI, and reload the browser page (hard-refresh if the old UI remains). The workflow files and generation engine are unchanged. **The separate report of static/noise in the second 15-second Review chunk is still under investigation; this hotfix does not claim to fix it.**
 
 <img width="1536" height="1024" alt="exec-55ad0463-8655-409c-b9a6-49d1315cdd78" src="https://github.com/user-attachments/assets/063bb16b-5c25-44f8-9304-031995502b26" />
