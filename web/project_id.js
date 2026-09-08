@@ -421,6 +421,62 @@ function installProductionSerializationGuard(node) {
     node.__h3ContinuumProductionSerializationGuard = true;
 }
 
+function reviewModeSetupActive(node) {
+    return (
+        node?.comfyClass === V38_NODE_CLASS
+        && Boolean(node.__h3ContinuumModeSetup)
+        && findWidget(node, GENERATION_MODE_WIDGET)?.value === GENERATION_MODE_REVIEW
+    );
+}
+
+function installReviewModeSetupQueueContract(node) {
+    if (node.__h3ContinuumModeSetupQueueContract) return;
+    const generationWidget = findWidget(node, GENERATION_MODE_WIDGET);
+    if (!generationWidget) return;
+
+    // ComfyUI frontend 1.49 serializes API inputs through widget.serializeValue.
+    // Keep the visible/saved settings intact while making the first Queue after
+    // Full Run -> Review Each Chunk an explicit, non-destructive Chunk 1 branch.
+    const overrides = new Map([
+        [REVIEW_ACTION_WIDGET, REVIEW_ACTION_CONTINUE],
+        [REGENERATE_WIDGET, "Chunk 1"],
+        [REROLL_NONCE_WIDGET, 0],
+        [TAKE_GROUP_WIDGET, 0],
+        [TAKE_REVISION_WIDGET, ""],
+        [TAKE_ACTION_WIDGET, TAKE_ACTION_AUTOMATIC],
+    ]);
+    for (const [name, value] of overrides) {
+        const widget = findWidget(node, name);
+        if (!widget || widget.__h3ContinuumModeSetupSerializeValue) continue;
+        const previous = widget.serializeValue;
+        widget.serializeValue = function(...args) {
+            if (reviewModeSetupActive(node)) return value;
+            return typeof previous === "function"
+                ? previous.apply(this, args)
+                : this.value;
+        };
+        widget.__h3ContinuumModeSetupSerializeValue = true;
+    }
+
+    const previousBeforeQueued = generationWidget.beforeQueued;
+    generationWidget.beforeQueued = function(...args) {
+        const result = previousBeforeQueued?.apply(this, args);
+        if (reviewModeSetupActive(node)) {
+            node.__h3ContinuumModeSetupQueued = {
+                setup: node.__h3ContinuumModeSetup,
+                runName: takeRunName(node),
+                promptId: "",
+            };
+            node.__h3ContinuumQueuedSettings = reviewSettingsSnapshot(node);
+            node.__h3ContinuumQueuedSettingsRun = takeRunName(node);
+        } else {
+            delete node.__h3ContinuumModeSetupQueued;
+        }
+        return result;
+    };
+    node.__h3ContinuumModeSetupQueueContract = true;
+}
+
 function addTransientProductionWidget(node, type, name, value, callback, options = {}) {
     if (typeof node.addWidget !== "function") return null;
     const widget = node.addWidget(
@@ -1039,6 +1095,14 @@ function configureIntuitiveV38Ux(node) {
         ),
         onSet: (value, source) => {
             const reviewing = value === FACADE_GENERATE_REVIEW;
+            if (reviewing && source.value !== GENERATION_MODE_REVIEW) {
+                // Selecting a mode is setup, not selecting a saved review.
+                node.__h3ContinuumModeSetup = {};
+                delete node.__h3ContinuumModeSetupQueued;
+            } else if (!reviewing) {
+                delete node.__h3ContinuumModeSetup;
+                delete node.__h3ContinuumModeSetupQueued;
+            }
             setExistingWidgetValue(
                 source,
                 reviewing ? GENERATION_MODE_REVIEW : GENERATION_MODE_FULL_RUN,
@@ -1372,6 +1436,43 @@ function rememberReviewSettings(node, requestedSettings) {
     delete node.__h3ContinuumQueuedSettingsRun;
 }
 
+function finishModeSetupAfterExecution(node, promptId = "") {
+    const queued = node.__h3ContinuumModeSetupQueued;
+    if (
+        !queued
+        || queued.setup !== node.__h3ContinuumModeSetup
+        || queued.runName !== takeRunName(node)
+        || (promptId && queued.promptId !== promptId)
+    ) {
+        return false;
+    }
+    delete node.__h3ContinuumModeSetupQueued;
+    delete node.__h3ContinuumModeSetup;
+    node.__h3ContinuumIntuitiveUxRefresh?.();
+    node.__h3ContinuumProductionUxRefresh?.();
+    return true;
+}
+
+function bindModeSetupPromptFromExecutedNode(event) {
+    const detail = event?.detail || event || {};
+    const promptId = String(detail.prompt_id || "");
+    const executedNodeId = String(detail.display_node || detail.node || "");
+    if (!promptId || !executedNodeId) return;
+    for (const node of app.graph?._nodes || []) {
+        const queued = node.__h3ContinuumModeSetupQueued;
+        if (
+            node.comfyClass !== V38_NODE_CLASS
+            || String(node.id) !== executedNodeId
+            || !queued
+            || queued.setup !== node.__h3ContinuumModeSetup
+            || queued.runName !== takeRunName(node)
+        ) {
+            continue;
+        }
+        queued.promptId = promptId;
+    }
+}
+
 function selectProductionRestart(node) {
     clearTakeSelection(node);
     setExistingWidgetValue(findWidget(node, REVIEW_ACTION_WIDGET), REVIEW_ACTION_CONTINUE);
@@ -1487,11 +1588,59 @@ function takeGroup(item) {
 }
 
 function takeCatalog(node) {
-    const revisions = node.__h3ContinuumTakeProject?.group_revisions;
+    const project = node.__h3ContinuumTakeProject;
+    const revisions = project?.group_revisions;
     if (!Array.isArray(revisions)) return [];
-    const sorted = revisions
+    const normalized = revisions
         .map((item) => ({ item, group: takeGroup(item) }))
-        .filter(({ item, group }) => group && String(item?.revision_id || ""))
+        .filter(({ item, group }) => group && String(item?.revision_id || ""));
+    if (!normalized.length) return [];
+
+    // project.json is an archive for every sampling lineage that has used this
+    // Run Name.  Take actions, however, are deliberately validated by the
+    // backend against the current canonical lineage only.  Never present old
+    // lineages (or orphaned ancestry) as actionable history.
+    const normalizedById = new Map(normalized.map(
+        (entry) => [String(entry.item.revision_id), entry],
+    ));
+    const activeIds = Object.values(project?.active_revisions || {}).map(String);
+    const anchor = normalizedById.get(String(project?.canonical_head_revision_id || ""))
+        || activeIds.map((revisionId) => normalizedById.get(revisionId)).find(Boolean)
+        || null;
+    const canonicalLineage = String(anchor?.item?.lineage_sha256 || "");
+    const lineageAware = normalized.some(
+        ({ item }) => Boolean(String(item?.lineage_sha256 || "")),
+    );
+    if (lineageAware && !canonicalLineage) return [];
+    const scoped = canonicalLineage
+        ? normalized.filter(
+            ({ item }) => String(item?.lineage_sha256 || "") === canonicalLineage,
+        )
+        : normalized;
+    const scopedById = new Map(scoped.map(
+        (entry) => [String(entry.item.revision_id), entry],
+    ));
+    const resolvable = ({ item }) => {
+        const reverse = [];
+        const seen = new Set();
+        let revisionId = String(item.revision_id || "");
+        while (revisionId) {
+            if (seen.has(revisionId)) return false;
+            seen.add(revisionId);
+            const entry = scopedById.get(revisionId);
+            if (!entry) return false;
+            reverse.push(entry);
+            revisionId = String(entry.item.parent_revision_id || "");
+        }
+        let expectedStart = 1;
+        for (const entry of reverse.reverse()) {
+            if (entry.group.start !== expectedStart) return false;
+            expectedStart = entry.group.end + 1;
+        }
+        return true;
+    };
+    const sorted = scoped
+        .filter(resolvable)
         .sort((left, right) => (
             left.group.physical_group - right.group.physical_group
             || String(left.item.revision_order || left.item.revision_id).localeCompare(
@@ -1638,6 +1787,10 @@ function takeStatus(node) {
         (item) => item.revision_id === project.canonical_head_revision_id,
     ) || null;
     const action = findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
+    const rawCount = Array.isArray(project.group_revisions)
+        ? project.group_revisions.length
+        : 0;
+    const hiddenCount = Math.max(0, rawCount - catalog.length);
     const lines = [
         `Selected: ${takeLabel(selected)} | ${shortRevision(selected.revision_id)}`,
         canonical
@@ -1646,37 +1799,19 @@ function takeStatus(node) {
         canonicalHead
             ? `Canonical head: ${takeLabel(canonicalHead)} | ${shortRevision(canonicalHead.revision_id)}`
             : "Canonical head: unavailable",
+        `Compatible history: ${catalog.length} Take${catalog.length === 1 ? "" : "s"}`,
         continueFromTakeSummary(project, selected, catalog),
     ];
+    if (hiddenCount) {
+        lines.push(
+            `${hiddenCount} incompatible or incomplete Take${hiddenCount === 1 ? "" : "s"} hidden`,
+        );
+    }
     if (findWidget(node, RUN_STORAGE_WIDGET)?.value === "Off") {
         lines.push("Run Storage: Off (history view only; a Take action enables storage)");
     }
     if (action !== TAKE_ACTION_AUTOMATIC) {
         lines.push(`Next Queue: ${action} (normal Queue required)`);
-    }
-    const groups = new Map();
-    for (const item of catalog) {
-        const key = item.group.physical_group;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(item);
-    }
-    for (const items of groups.values()) {
-        lines.push(`Group ${physicalGroupLabel(items[0].group)}`);
-        for (const item of items) {
-            const markers = [];
-            if (item.revision_id === selected.revision_id) markers.push("← Selected");
-            if (project.active_revisions?.[String(item.group.physical_group)] === item.revision_id) {
-                markers.push("✓ Canonical");
-            }
-            if (project.canonical_head_revision_id === item.revision_id) markers.push("Head");
-            lines.push(
-                `  Take ${item.take_number}/${item.take_count}`
-                + ` | ${shortRevision(item.revision_id)}`
-                + ` | nonce ${Number(item.variation_nonce || 0)}`
-                + ` | parent ${shortRevision(item.parent_revision_id)}`
-                + (markers.length ? ` | ${markers.join(" | ")}` : ""),
-            );
-        }
     }
     return lines.join("\n");
 }
@@ -1808,8 +1943,12 @@ async function loadTakeHistory(node) {
 }
 
 function refreshV38TakeHistoryAfterExecution(event) {
+    const promptId = String(event?.detail?.prompt_id || "");
     for (const node of app.graph?._nodes || []) {
         if (node.comfyClass !== V38_NODE_CLASS) continue;
+        if (event?.type === "execution_success" && promptId) {
+            finishModeSetupAfterExecution(node, promptId);
+        }
         if (event?.type !== "execution_success") delete node.__h3ContinuumQueuedSettings;
         void loadTakeHistory(node);
         setTimeout(() => void loadTakeHistory(node), 250);
@@ -1906,6 +2045,8 @@ function configureProductionReviewUx(node) {
             PRODUCTION_RETURN_TO_REVIEW_WIDGET,
             null,
             () => {
+                delete node.__h3ContinuumModeSetup;
+                delete node.__h3ContinuumModeSetupQueued;
                 node.__h3ContinuumReviewSettingsOpen = false;
                 node.__h3ContinuumIntuitiveUxRefresh?.();
                 node.__h3ContinuumProductionUxRefresh?.();
@@ -1946,16 +2087,20 @@ function configureProductionReviewUx(node) {
                 options: { serialize: false },
                 [PRODUCTION_TRANSIENT_WIDGET]: true,
                 draw(ctx, _node, width, y, height) {
+                    const renderHeight = Math.max(
+                        28,
+                        Number(this.computeSize?.(width)?.[1] || height || 28),
+                    );
                     ctx.save();
                     ctx.beginPath();
-                    ctx.rect(15, y + 4, Math.max(1, width - 30), height - 8);
+                    ctx.rect(15, y + 4, Math.max(1, width - 30), renderHeight - 8);
                     ctx.clip();
                     ctx.fillStyle = "#eeeeee";
                     ctx.font = "12px Arial";
                     ctx.textAlign = "left";
                     ctx.textBaseline = "top";
                     const lines = String(this.value || "").split("\n");
-                    const count = Math.max(1, Math.floor((height - 12) / 16));
+                    const count = Math.max(1, Math.floor((renderHeight - 12) / 16));
                     for (let i = 0; i < Math.min(lines.length, count); i++) {
                         ctx.fillText(lines[i], 18, y + 6 + i * 16, Math.max(1, width - 36));
                     }
@@ -1974,7 +2119,10 @@ function configureProductionReviewUx(node) {
             takeStatusWidget.disabled = true;
             takeStatusWidget.computeSize = () => {
                 const lines = String(takeStatusWidget.value || "").split("\n").length;
-                return [Math.max(300, Number(node.size?.[0] || 0)), Math.min(300, 42 + lines * 16)];
+                return [
+                    Math.max(300, Number(node.size?.[0] || 0)),
+                    Math.min(124, Math.max(44, 12 + lines * 16)),
+                ];
             };
             setWidgetTooltip(takeStatusWidget, (
                 "Read-only Branch Provenance from Run Storage. Selecting a Take does not "
@@ -2004,6 +2152,7 @@ function configureProductionReviewUx(node) {
             const previous = node.onExecuted;
             node.onExecuted = function(...args) {
                 const result = previous?.apply(this, args);
+                finishModeSetupAfterExecution(this);
                 void loadTakeHistory(this);
                 return result;
             };
@@ -2029,8 +2178,9 @@ function configureProductionReviewUx(node) {
         } else if (!ready) {
             node.__h3ContinuumReviewSettingsOpen = false;
         }
-        const settingsOpen = ready && Boolean(node.__h3ContinuumReviewSettingsOpen);
-        const reviewOpen = ready && !settingsOpen;
+        const modeSetup = Boolean(node.__h3ContinuumModeSetup);
+        const settingsOpen = ready && !modeSetup && Boolean(node.__h3ContinuumReviewSettingsOpen);
+        const reviewOpen = ready && !modeSetup && !settingsOpen;
         const from = findWidget(node, REGENERATE_WIDGET)?.value;
         const edited = reviewSettingsChanged(node);
         const canReview = !edited && (!from || from === "Auto" || from === 0);
@@ -2064,9 +2214,9 @@ function configureProductionReviewUx(node) {
             } else if (widget.name === PRODUCTION_BACK_TO_SETTINGS_WIDGET) {
                 setWidgetVisible(widget, reviewOpen);
             } else if (widget.name === PRODUCTION_RETURN_TO_REVIEW_WIDGET) {
-                setWidgetVisible(widget, settingsOpen);
+                setWidgetVisible(widget, settingsOpen || (ready && modeSetup));
             } else if (widget.name === PRODUCTION_RESTART_WIDGET) {
-                setWidgetVisible(widget, ready);
+                setWidgetVisible(widget, ready && !modeSetup);
             } else if (widget.name === TAKE_TOGGLE_WIDGET) {
                 setWidgetVisible(widget, reviewOpen && takeCount > 0);
             } else if (historyNames.has(widget.name)) {
@@ -2090,6 +2240,7 @@ function configureProductionReviewUx(node) {
         }
         const catalog = takeCatalog(node);
         const hasSelection = Boolean(selectedTake(node));
+        const takeActionAvailable = hasSelection && !edited;
         const historyToggle = transientProductionWidgets(node).find(
             (widget) => widget.name === TAKE_TOGGLE_WIDGET,
         );
@@ -2116,7 +2267,7 @@ function configureProductionReviewUx(node) {
         }
         for (const name of [TAKE_USE_WIDGET, TAKE_CONTINUE_WIDGET]) {
             const widget = transientProductionWidgets(node).find((item) => item.name === name);
-            if (widget) widget.disabled = !hasSelection;
+            if (widget) widget.disabled = !takeActionAvailable;
         }
         if (reviewOpen) {
             for (const widget of facadeProductionWidgets(node)) {
@@ -2514,20 +2665,42 @@ function prepareReviewQueueIntent(node, apiInputs) {
     const selectedAction = actionWidget.value;
     const from = findWidget(node, REGENERATE_WIDGET)?.value;
     const staleReview = node.__h3ContinuumReviewSettingsChanged?.() || false;
+    const modeSetup = Boolean(node.__h3ContinuumModeSetup);
+    const savedStatus = canonicalStorageRevision(node.__h3ContinuumTakeProject)?.status;
+    const savedReview = ["review_ready", "complete"].includes(savedStatus);
     const manualRegenerate = from && from !== "Auto" && from !== 0;
-    const submittedAction = generationMode === GENERATION_MODE_FULL_RUN || staleReview || manualRegenerate
+    const submittedAction = generationMode === GENERATION_MODE_FULL_RUN || staleReview || manualRegenerate || modeSetup
         ? REVIEW_ACTION_CONTINUE
         : selectedAction;
-    if (staleReview || manualRegenerate) {
+    if (staleReview || manualRegenerate || modeSetup) {
         actionWidget.value = REVIEW_ACTION_CONTINUE;
         delete node[REVIEW_UI_SELECTION];
     }
     apiInputs[GENERATION_MODE_WIDGET] = generationMode;
     apiInputs[REVIEW_ACTION_WIDGET] = submittedAction;
-    const takeAction = findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
+    let takeAction = findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
     apiInputs[TAKE_GROUP_WIDGET] = Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
     apiInputs[TAKE_REVISION_WIDGET] = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
     apiInputs[TAKE_ACTION_WIDGET] = takeAction;
+    if (generationMode === GENERATION_MODE_REVIEW && modeSetup) {
+        // Saved results are history, not the first result of a newly selected
+        // Review Each Chunk run. Start a non-destructive branch at Chunk 1 in
+        // the queued payload; keep the visible settings unchanged.
+        if (savedReview) {
+            apiInputs[REGENERATE_WIDGET] = "Chunk 1";
+            apiInputs[REROLL_NONCE_WIDGET] = 0;
+            apiInputs[TAKE_GROUP_WIDGET] = 0;
+            apiInputs[TAKE_REVISION_WIDGET] = "";
+            apiInputs[TAKE_ACTION_WIDGET] = TAKE_ACTION_AUTOMATIC;
+            takeAction = TAKE_ACTION_AUTOMATIC;
+        }
+        node.__h3ContinuumModeSetupQueued = {
+            setup: node.__h3ContinuumModeSetup,
+            runName: takeRunName(node),
+        };
+    } else {
+        delete node.__h3ContinuumModeSetupQueued;
+    }
     node.__h3ContinuumCaptureReviewSettings?.();
     if (node.__h3ContinuumRestartSelected && from === "Chunk 1") {
         node.__h3ContinuumRestartQueued = true;
@@ -2677,6 +2850,7 @@ function configureNode(node) {
     configureReviewControls(node);
     configureIntuitiveV38Ux(node);
     configureProductionReviewUx(node);
+    installReviewModeSetupQueueContract(node);
     applyV38View(node);
     node.setDirtyCanvas?.(true, true);
     return projectWidget;
@@ -2693,6 +2867,10 @@ app.registerExtension({
     name: "H3Continuum.ProjectId",
 
     setup() {
+        app.api?.addEventListener?.(
+            "executed",
+            bindModeSetupPromptFromExecutedNode,
+        );
         for (const eventName of [
             "execution_success",
             "execution_error",
@@ -2763,6 +2941,12 @@ app.registerExtension({
                     node.__h3ContinuumResolutionUxRefresh?.();
                     requireFixedSeedForReview(node);
                     normalizeRunStorageState(node, apiNode.inputs);
+                    if (
+                        node.comfyClass === V38_NODE_CLASS
+                        && node.__h3ContinuumModeSetup
+                    ) {
+                        await loadTakeHistory(node);
+                    }
                     prepareReviewQueueIntent(node, apiNode.inputs);
                     apiNode.inputs.diagnostics = settingValue(SETTINGS.detailedReport, false)
                         ? "Detailed Report"

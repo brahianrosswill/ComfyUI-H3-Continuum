@@ -266,6 +266,7 @@ def test_f0_f7_frontend_review_lifecycle(tmp_path):
             _function_source(source, "isOneShotReviewAction", "normalizeReviewActionOnLoad"),
             _function_source(source, "normalizeReviewActionOnLoad", "resetReviewActionAfterQueued"),
             _function_source(source, "resetReviewActionAfterQueued", "prepareReviewQueueIntent"),
+            _function_source(source, "canonicalStorageRevision", "reviewSettingsSnapshot"),
             _function_source(source, "prepareReviewQueueIntent", "configureReviewControls"),
             _function_source(source, "configureReviewControls", "configureAssembler"),
         )
@@ -745,14 +746,17 @@ const finished = {{
     plan: findWidget(node, PRODUCTION_STATUS_WIDGET).value,
 }};
 
-node.__h3ContinuumTakeProject = {{
-    branch_provenance_version: 1,
-    active_revisions: {{ "3": "r3b" }},
-    group_revisions: [
-        {{ revision_id: "r3a", revision_order: "1", group: {{ physical_group: 3 }} }},
-        {{ revision_id: "r3b", revision_order: "2", group: {{ physical_group: 3 }} }},
-    ],
-}};
+    node.__h3ContinuumTakeProject = {{
+        branch_provenance_version: 1,
+        canonical_head_revision_id: "r3b",
+        active_revisions: {{ "1": "r1", "2": "r2", "3": "r3b" }},
+        group_revisions: [
+            {{ revision_id: "r1", parent_revision_id: null, revision_order: "1", group: {{ physical_group: 1 }} }},
+            {{ revision_id: "r2", parent_revision_id: "r1", revision_order: "2", group: {{ physical_group: 2 }} }},
+            {{ revision_id: "r3a", parent_revision_id: "r2", revision_order: "3a", group: {{ physical_group: 3 }} }},
+            {{ revision_id: "r3b", parent_revision_id: "r2", revision_order: "3b", group: {{ physical_group: 3 }} }},
+        ],
+    }};
 node.__h3ContinuumProductionUxRefresh();
 findWidget(node, TAKE_PREVIOUS_WIDGET).callback();
 findWidget(node, TAKE_USE_WIDGET).callback();
@@ -921,13 +925,16 @@ const project = {{
         "5": "r56a-canonical-head",
     }},
     group_revisions: [
-        {{ revision_id: "r1-root", parent_revision_id: null, variation_nonce: 0, revision_order: "01", group: {{ physical_group: 1, start: 1, end: 1 }} }},
-        {{ revision_id: "r2-main", parent_revision_id: "r1-root", variation_nonce: 0, revision_order: "02", group: {{ physical_group: 2, start: 2, end: 2 }} }},
-        {{ revision_id: "r3a-canonical", parent_revision_id: "r2-main", variation_nonce: 1, revision_order: "03a", group: {{ physical_group: 3, start: 3, end: 3 }} }},
-        {{ revision_id: "r3b-selected", parent_revision_id: "r2-main", variation_nonce: 2, revision_order: "03b", group: {{ physical_group: 3, start: 3, end: 3 }} }},
-        {{ revision_id: "r4a-canonical", parent_revision_id: "r3a-canonical", variation_nonce: 1, revision_order: "04a", group: {{ physical_group: 4, start: 4, end: 4 }} }},
-        {{ revision_id: "r4b-branch", parent_revision_id: "r3b-selected", variation_nonce: 2, revision_order: "04b", group: {{ physical_group: 4, start: 4, end: 4 }} }},
-        {{ revision_id: "r56a-canonical-head", parent_revision_id: "r4a-canonical", variation_nonce: 1, revision_order: "05", group: {{ physical_group: 5, start: 5, end: 6 }} }},
+        {{ revision_id: "r1-root", parent_revision_id: null, lineage_sha256: "current-lineage", variation_nonce: 0, revision_order: "01", group: {{ physical_group: 1, start: 1, end: 1 }} }},
+        {{ revision_id: "r2-main", parent_revision_id: "r1-root", lineage_sha256: "current-lineage", variation_nonce: 0, revision_order: "02", group: {{ physical_group: 2, start: 2, end: 2 }} }},
+        {{ revision_id: "r3a-canonical", parent_revision_id: "r2-main", lineage_sha256: "current-lineage", variation_nonce: 1, revision_order: "03a", group: {{ physical_group: 3, start: 3, end: 3 }} }},
+        {{ revision_id: "r3b-selected", parent_revision_id: "r2-main", lineage_sha256: "current-lineage", variation_nonce: 2, revision_order: "03b", group: {{ physical_group: 3, start: 3, end: 3 }} }},
+        {{ revision_id: "r4a-canonical", parent_revision_id: "r3a-canonical", lineage_sha256: "current-lineage", variation_nonce: 1, revision_order: "04a", group: {{ physical_group: 4, start: 4, end: 4 }} }},
+        {{ revision_id: "r4b-branch", parent_revision_id: "r3b-selected", lineage_sha256: "current-lineage", variation_nonce: 2, revision_order: "04b", group: {{ physical_group: 4, start: 4, end: 4 }} }},
+        {{ revision_id: "r56a-canonical-head", parent_revision_id: "r4a-canonical", lineage_sha256: "current-lineage", variation_nonce: 1, revision_order: "05", group: {{ physical_group: 5, start: 5, end: 6 }} }},
+        {{ revision_id: "old-root", parent_revision_id: null, lineage_sha256: "old-lineage", variation_nonce: 0, revision_order: "old-01", group: {{ physical_group: 1, start: 1, end: 1 }} }},
+        {{ revision_id: "old-group-2", parent_revision_id: "old-root", lineage_sha256: "old-lineage", variation_nonce: 0, revision_order: "old-02", group: {{ physical_group: 2, start: 2, end: 2 }} }},
+        {{ revision_id: "orphan-group-2", parent_revision_id: "missing-root", lineage_sha256: "current-lineage", variation_nonce: 3, revision_order: "orphan", group: {{ physical_group: 2, start: 2, end: 2 }} }},
     ],
 }};
 
@@ -943,6 +950,7 @@ const one = makeNode({{
 const oneText = takeStatus(one);
 
 const node = makeNode(project);
+const catalogIds = takeCatalog(node).map((item) => item.revision_id);
 findWidget(node, TAKE_GROUP_WIDGET).value = 3;
 findWidget(node, TAKE_REVISION_WIDGET).value = "r3b-selected";
 const selectedText = takeStatus(node);
@@ -1012,6 +1020,7 @@ const missingResult = {{
 console.log(JSON.stringify({{
     oneText,
     selectedText,
+    catalogIds,
     canonicalBefore,
     previous,
     next,
@@ -1032,18 +1041,22 @@ console.log(JSON.stringify({{
     )
     observed = json.loads(result.stdout)
 
-    assert "Group 1\n  Take 1/1" in observed["oneText"]
-    assert "✓ Canonical | Head" in observed["oneText"]
+    assert "Selected: Group 1 / Take 1" in observed["oneText"]
+    assert "Compatible history: 1 Take" in observed["oneText"]
     assert "Run Storage: Off" in observed["oneText"]
 
     selected = observed["selectedText"]
     assert "Selected: Group 3 / Take 2 | r3b-selected" in selected
     assert "Canonical: Group 3 / Take 1 | r3a-canonic" in selected
     assert "Canonical head: Group 5-6 (atomic) / Take 1 | r56a-canonic" in selected
+    assert "Compatible history: 7 Takes" in selected
+    assert "3 incompatible or incomplete Takes hidden" in selected
     assert "Continue From Here: Reuse Groups 1-3" in selected
     assert "Regenerate Groups 4, 5-6 (atomic)" in selected
-    assert "Take 2/2 | r3b-selected | nonce 2 | parent r2-main | ← Selected" in selected
-    assert "Take 1/2 | r3a-canonica | nonce 1" in selected
+    assert observed["catalogIds"] == [
+        "r1-root", "r2-main", "r3a-canonical", "r3b-selected",
+        "r4a-canonical", "r4b-branch", "r56a-canonical-head",
+    ]
 
     assert observed["previous"] == {
         "group": 3,

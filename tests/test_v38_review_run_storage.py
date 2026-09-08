@@ -224,6 +224,7 @@ def _resolve(
     take_action: str = "Automatic",
     take_group: int = 0,
     take_revision_id: str = "",
+    manual_regenerate_from: int = 0,
 ):
     controller = RunStorageController("phase-d-review")
     controller.run_root = tmp_path / "run"
@@ -233,7 +234,7 @@ def _resolve(
     controller.configure_review(
         generation_mode=generation_mode,
         review_action=review_action,
-        manual_regenerate_from=0,
+        manual_regenerate_from=manual_regenerate_from,
         take_action=take_action,
         take_group=take_group,
         take_revision_id=take_revision_id,
@@ -505,6 +506,67 @@ def test_n3_continue_after_nonce_two_keeps_branch_and_nonce(tmp_path):
     )
     _, resolved, nonce, _ = _resolve(tmp_path, _contract())
     assert (resolved["reroll_from_chunk"], nonce) == (2, 2)
+
+
+def test_complete_three_chunk_run_can_start_fresh_review_and_advance_one_chunk(
+    tmp_path,
+):
+    base = _contract(chunks=3)
+    _persist(
+        tmp_path,
+        base,
+        prefix=3,
+        review_unit=(3, 3),
+        updated_utc="2026-08-31T00:00:01+00:00",
+    )
+
+    first, chunk_1, nonce_1, _ = _resolve(
+        tmp_path,
+        base,
+        manual_regenerate_from=1,
+    )
+    assert (chunk_1["reroll_from_chunk"], nonce_1) == (1, 1)
+    assert first.review_execution.max_new_physical_groups == 1
+    assert (
+        first.review_execution.next_review_unit_start,
+        first.review_execution.next_review_unit_end,
+    ) == (1, 1)
+    _persist(
+        tmp_path,
+        chunk_1,
+        prefix=1,
+        review_unit=(1, 1),
+        updated_utc="2026-08-31T00:00:02+00:00",
+    )
+
+    second, chunk_2, nonce_2, _ = _resolve(tmp_path, base)
+    assert (chunk_2["reroll_from_chunk"], nonce_2) == (1, 1)
+    assert (
+        second.review_execution.next_review_unit_start,
+        second.review_execution.next_review_unit_end,
+    ) == (2, 2)
+    _persist(
+        tmp_path,
+        chunk_2,
+        prefix=2,
+        review_unit=(2, 2),
+        updated_utc="2026-08-31T00:00:03+00:00",
+    )
+
+    third, chunk_3, nonce_3, _ = _resolve(tmp_path, base)
+    assert (chunk_3["reroll_from_chunk"], nonce_3) == (1, 1)
+    assert (
+        third.review_execution.next_review_unit_start,
+        third.review_execution.next_review_unit_end,
+    ) == (3, 3)
+    complete = _persist(
+        tmp_path,
+        chunk_3,
+        prefix=3,
+        review_unit=(3, 3),
+        updated_utc="2026-08-31T00:00:04+00:00",
+    )
+    assert complete.manifest["status"] == REVISION_STATUS_COMPLETE
 
 
 def test_n4_interrupted_nonce_two_resume_does_not_advance(tmp_path):

@@ -364,6 +364,7 @@ setTimeout(() => {{
   const historyHiddenBeforeTake = node.widgets.find(
     (item) => item.name === "Render History",
   ).hidden;
+  prepareReviewQueueIntent(node, {{}});
   node.__h3ContinuumTakeProject = {{
     branch_provenance_version: 1,
     canonical_storage_revision_id: "storage-ready",
@@ -378,6 +379,8 @@ setTimeout(() => {{
       group: {{ start: 1, end: 1, physical_group: 1 }},
     }}],
   }};
+  finishModeSetupAfterExecution(node);
+  node.__h3ContinuumRememberReviewSettings(); // The queued generation completed.
   node.__h3ContinuumProductionUxRefresh();
   const reviewButtonsVisibleWhenReady = [
     "Use it and continue", "Try this chunk again", "Use it and finish the rest",

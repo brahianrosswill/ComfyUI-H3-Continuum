@@ -22,13 +22,27 @@ globalThis.fetch = async () => {
   if (fetchMode === "error") throw new Error("offline fixture");
   return project ? {ok:true, status:200, json:async()=>structuredClone(project)} : {ok:false,status:404};
 };
+const apiListeners=new Map();
 globalThis.__app = {
   graph: {_nodes: [], links:{}, getNodeById:()=>null},
   ui:{settings:{getSettingValue:(_id,fallback)=>fallback,addSetting(){}}},
+  api:{addEventListener(name,callback){
+    const callbacks=apiListeners.get(name)||[];callbacks.push(callback);apiListeners.set(name,callbacks);
+  }},
   registerExtension(extension){this.extension=extension;}
 };
 '''
     cases = r'''
+app.extension.setup();
+function emit(name,detail){for(const callback of apiListeners.get(name)||[])callback({type:name,detail});}
+async function serializedInputs(n){
+  const inputs={};
+  for(const [index,widget] of n.widgets.entries()){
+    if(!widget.name||widget.options?.serialize===false)continue;
+    inputs[widget.name]=widget.serializeValue?await widget.serializeValue(n,index):widget.value;
+  }
+  return inputs;
+}
 function makeNode() {
   const values = {
     prompt_mode:"Auto",chunks:2,chunk_seconds:5,aspect:"Auto from First Image",
@@ -97,8 +111,12 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
     w(n,"Render History").callback();assert(visible(n,"Render History / Takes"));
     const drawn=[];
     const ctx={save(){},restore(){},beginPath(){},rect(){},clip(){},fillText(text){drawn.push(text);}};
-    w(n,"Render History / Takes").draw(ctx,n,400,0,300);
+    const historyWidget=w(n,"Render History / Takes");
+    const historyHeight=historyWidget.computeSize(400)[1];
+    assert(historyHeight<=124,"history must not reserve a large empty panel");
+    historyWidget.draw(ctx,n,400,0,20);
     assert(drawn.some(text=>text.startsWith("Selected:")),"selected Take is actually drawn, not an empty text widget");
+    assert(drawn.length>1,"history draw must use its computed height, not the frontend's single-row hint");
     w(n,"Render History").callback();assert(!visible(n,"Render History / Takes"));
     w(n,"Try this chunk again").callback();
     const inputs={};prepareReviewQueueIntent(n,inputs);
@@ -132,6 +150,137 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
   w(reloaded,"generation_mode").value="Review Each Chunk";
   w(reloaded,"run_storage").value="Off";reloaded.__h3ContinuumProductionUxRefresh();
   assert(buttons.every(name=>!visible(reloaded,name)),"storage off does not expose review actions");
+  // Mode selection is setup, not a request to review an old saved result.
+  for (const oldStatus of ["complete", "review_ready"]) {
+    for (const storage of ["Off", "Save + Auto Resume"]) {
+      const setup=makeNode();
+      setup.inputs=["model","clip","video_vae","sampler","sigmas"].map(name=>({name,link:1}));
+      w(setup,"size_source").value="Manual";
+      w(setup,"Run").callback("Generate Full Video");
+      w(setup,"run_storage").value=storage;
+      const old=state(oldStatus,{start:1,end:1,physical_group:1},`old-${oldStatus}-${storage}`);
+      await load(setup,old);
+      const before=setup.serialize().widgets_values.slice();
+      w(setup,"Run").callback("Review Each Chunk");
+      assert(visible(setup,"Chunks")&&visible(setup,"Run"),"mode switch keeps setup visible");
+      assert(visible(setup,"Ready to Queue"),"mode switch keeps Queue-ready summary");
+      assert.equal(w(setup,"Ready to Queue").__h3ContinuumInfoVariant,"ready");
+      assert(!visible(setup,"Review Ready"),"old completion must not replace setup");
+      assert(buttons.every(name=>!visible(setup,name)),"no retry/continue before choosing review");
+      assert(!visible(setup,"Start again from Chunk 1"),"no restart button in mode setup");
+      assert(visible(setup,"Return to Review"),"saved review remains explicitly accessible");
+      const after=setup.serialize().widgets_values;
+      const changed=before.flatMap((v,i)=>v===after[i]?[]:[[v,after[i]]]);
+      assert.deepEqual(changed,storage==="Off"
+        ? [["Off","Save + Auto Resume"],["Full Run","Review Each Chunk"]]
+        : [["Full Run","Review Each Chunk"]],"mode switch must not reset generation intent or identity");
+      await load(setup,old);
+      assert(visible(setup,"Chunks"),"same history refresh cannot reopen old review");
+      w(setup,"Return to Review").callback();
+      assert(visible(setup,"Try this chunk again"),"explicit return still opens saved result");
+      w(setup,"Try this chunk again").callback();
+      w(setup,"Back to Settings").callback();
+      w(setup,"Run").callback("Generate Full Video");
+      w(setup,"Run").callback("Review Each Chunk");
+      const inputs={reroll_from_chunk:"Auto",reroll_nonce:0,
+        take_group:9,take_revision_id:"stale-take",take_action:"Use This Take"};
+      prepareReviewQueueIntent(setup,inputs);
+      assert.equal(inputs.review_action,"Continue / Next");
+      if(["complete","review_ready"].includes(oldStatus)){
+        assert.equal(inputs.reroll_from_chunk,"Chunk 1","saved history starts a new review branch");
+        assert.equal(inputs.reroll_nonce,0);
+        assert.equal(inputs.take_group,0);
+        assert.equal(inputs.take_revision_id,"");
+        assert.equal(inputs.take_action,"Automatic");
+      }
+      await load(setup,old);
+      assert(visible(setup,"Chunks"),"Queue alone does not mean generation completed");
+      project=state("review_ready",{start:1,end:1,physical_group:1},"new-output");
+      setup.onExecuted();
+      await new Promise(resolve=>setImmediate(resolve));
+      assert(buttons.every(name=>visible(setup,name)),"new queued result opens ordinary review");
+      assert(!visible(setup,"Chunks"));
+    }
+  }
+  const delayedSetup=makeNode();await load(delayedSetup,null);
+  w(delayedSetup,"Run").callback("Generate Full Video");
+  w(delayedSetup,"Run").callback("Review Each Chunk");
+  await load(delayedSetup,state("complete",{start:2,end:2,physical_group:2},"late-old-history"));
+  assert(visible(delayedSetup,"Chunks")&&!visible(delayedSetup,"Review Ready"),"late initial history cannot leave setup");
+  // A result queued before the user's mode selection must not steal setup focus.
+  const priorFlight=makeNode();await load(priorFlight,null);
+  w(priorFlight,"Run").callback("Generate Full Video");
+  prepareReviewQueueIntent(priorFlight,{});
+  w(priorFlight,"Run").callback("Review Each Chunk");
+  await load(priorFlight,state("complete",{start:2,end:2,physical_group:2},"prior-flight"));
+  assert(visible(priorFlight,"Chunks")&&!visible(priorFlight,"Review Ready"));
+  const newRunSetup=makeNode();await load(newRunSetup,null);
+  w(newRunSetup,"Run").callback("Generate Full Video");
+  w(newRunSetup,"Run").callback("Review Each Chunk");
+  prepareReviewQueueIntent(newRunSetup,{});
+  w(newRunSetup,"run_name").value="different-run";
+  await load(newRunSetup,state("complete",{start:2,end:2,physical_group:2},"unrelated-history"));
+  assert(visible(newRunSetup,"Chunks")&&!visible(newRunSetup,"Review Ready"));
+  const wrongExecution=makeNode();
+  await load(wrongExecution,state("complete",{start:3,end:3,physical_group:3},"wrong-run-old"));
+  w(wrongExecution,"Run").callback("Generate Full Video");
+  w(wrongExecution,"Run").callback("Review Each Chunk");
+  prepareReviewQueueIntent(wrongExecution,{reroll_from_chunk:"Auto",reroll_nonce:0});
+  w(wrongExecution,"run_name").value="changed-after-queue";
+  project=state("review_ready",{start:1,end:1,physical_group:1},"wrong-run-result");
+  wrongExecution.onExecuted();await new Promise(resolve=>setImmediate(resolve));
+  assert(visible(wrongExecution,"Chunks")&&!visible(wrongExecution,"Review Ready"),
+    "another Run identity cannot release the queued setup token");
+  // Frontend 1.49 contract: widget.beforeQueued runs before serializeValue;
+  // legacy beforeQueuePrompt is not part of the real queue path.
+  const liveContract=makeNode();liveContract.id=312;app.graph._nodes=[liveContract];
+  await load(liveContract,state("complete",{start:3,end:3,physical_group:3},"live-old-complete"));
+  w(liveContract,"Run").callback("Generate Full Video");
+  w(liveContract,"Run").callback("Review Each Chunk");
+  for(const widget of liveContract.widgets)widget.beforeQueued?.({isPartialExecution:false});
+  const liveInputs=await serializedInputs(liveContract);
+  assert.equal(liveInputs.reroll_from_chunk,"Chunk 1");
+  assert.equal(liveInputs.reroll_nonce,0);
+  assert.equal(liveInputs.take_group,0);
+  assert.equal(liveInputs.take_revision_id,"");
+  assert.equal(liveInputs.take_action,"Automatic");
+  assert.equal(liveInputs.review_action,"Continue / Next");
+  assert.equal(w(liveContract,"reroll_from_chunk").value,"Auto","visible settings stay unchanged");
+  project=state("review_ready",{start:1,end:1,physical_group:1},"live-fresh-chunk-1");
+  emit("executed",{node:"312",prompt_id:"live-prompt"});
+  emit("execution_success",{prompt_id:"live-prompt"});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert(buttons.every(name=>visible(liveContract,name)),"real completion events open Chunk 1 review");
+  assert.match(w(liveContract,"Review Ready").value,/Chunk 1/);
+  // Acceptance lifecycle: 3 x 5 seconds must stop at every review boundary.
+  const flow=makeNode();w(flow,"chunks").value=3;w(flow,"chunk_seconds").value=5;
+  await load(flow,state("complete",{start:3,end:3,physical_group:3},"old-complete-3x5"));
+  w(flow,"Run").callback("Generate Full Video");
+  w(flow,"Run").callback("Review Each Chunk");
+  const chunk1Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
+  prepareReviewQueueIntent(flow,chunk1Inputs);
+  assert.equal(chunk1Inputs.reroll_from_chunk,"Chunk 1");
+  project=state("review_ready",{start:1,end:1,physical_group:1},"fresh-chunk-1");
+  flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
+  assert(buttons.every(name=>visible(flow,name)),"Chunk 1 opens the review screen");
+  assert.match(w(flow,"Review Ready").value,/Chunk 1/);
+  w(flow,"Use it and continue").callback();
+  const chunk2Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
+  prepareReviewQueueIntent(flow,chunk2Inputs);
+  assert.equal(chunk2Inputs.reroll_from_chunk,"Auto","continuation does not restart Chunk 1");
+  project=state("review_ready",{start:2,end:2,physical_group:2},"fresh-chunk-2");
+  flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
+  assert(buttons.every(name=>visible(flow,name)),"Chunk 2 opens the review screen");
+  assert.match(w(flow,"Review Ready").value,/Chunk 2/);
+  w(flow,"Use it and continue").callback();
+  const chunk3Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
+  prepareReviewQueueIntent(flow,chunk3Inputs);
+  assert.equal(chunk3Inputs.reroll_from_chunk,"Auto");
+  project=state("complete",{start:3,end:3,physical_group:3},"fresh-chunk-3");
+  flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
+  assert(visible(flow,"Try this chunk again"),"Chunk 3 completion remains reviewable");
+  assert(!visible(flow,"Use it and continue")&&!visible(flow,"Use it and finish the rest"));
+  assert.match(w(flow,"Review Ready").value,/Saved sequence is complete/);
   // Hotfix: stale saved review cannot offer/submit Retry after settings edits.
   const edited=makeNode();w(edited,"chunks").value=4;
   const originalProject=state("review_ready",{start:2,end:2,physical_group:2},"edit-base");
