@@ -1,5 +1,12 @@
 # Project State
 
+## Review UI hotfix — validated for user-authorized main publication (2026-09-08)
+
+- User explicitly authorized a hotfix commit/push to existing origin/main for the confirmed Xarfai Review restart UI mismatch. Scope is frontend only: withdraw stale review actions after settings edits, preserve manual regeneration boundaries, add a non-destructive one-shot Start again from Chunk 1 button. Saved takes, sampler/transport/Audio/schema/workflow files and installed runtime remain unchanged.
+- Browser-side edit detection only withdraws stale actions; it does not approve saved-prefix reuse. Existing Run Storage compatibility checks remain authoritative. The separate 15-second Review chunk2 static/noise report is unresolved and is explicitly excluded from the hotfix claim.
+- Related pre-fix diagnostic evidence: D:/Codex/_test_results/ComfyUI-H3-Continuum/v38-xarfai-review-20260908/FINDINGS.md. New validation/publication evidence: D:/Codex/_test_results/ComfyUI-H3-Continuum/v38-review-hotfix-20260908. Initial source snapshots: nine verified one-file snapshots under before-review-hotfix-*. Final checks and publication result are recorded in WORKLOG and the task response.
+- Final full guarded CPU suite1155/1155 PASS (46.62s), focused61 PASS, Registry105/105 and source declaration256/256 hashes match. All guarded processes exited CUDA-uninitialized, zero blocked initialization calls. Final additions cover delayed history response and queued-baseline isolation between Run Names. User authorized waiving the external review once due delayed delivery; the fixed H3情報チェック reply subsequently arrived with PASS / PUSH TO MAIN OK. Non-blocking review note: keep revision updated_utc tied to backend writes, not ordinary history reads. No GPU or Registry/tag/release-asset publication.
+
 ## Main publication preparation (2026-09-07)
 
 - User explicitly approved commit/push to existing origin/main, then prioritized immediate README/file upload after announcing on Civitai and requested no further workflow tests. Publish the current Spectrum graph as MiniMax_H3_Continuum_V38.json and its matching ZIP, unchanged: JSON SHA e490c87e4995930f95c8fffc4c678111d7897e74003e1962b9b4a247ba43f4ac; ZIP SHA 83d28cc0cd549066962dc21ceae05d2b189fe22391b556887eab2cc1800e1e80. README, migration, package declarations and tests now describe one graph in two formats requiring Spectrum/rgthree/KJNodes/Easy Use. No separate Turbo graph and no prompt/media/title cleanup.

@@ -80,6 +80,7 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
   }
   for(const count of [1,2,3,4,5,6]){
     w(n,"chunks").value=count;
+    prepareReviewQueueIntent(n,{}); // This completion belongs to the current settings.
     const p=state("complete",{start:count,end:count,physical_group:count},`done-${count}`);
     await load(n,p);
     assert(visible(n,"Try this chunk again"),`retry complete ${count}`);
@@ -131,6 +132,82 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
   w(reloaded,"generation_mode").value="Review Each Chunk";
   w(reloaded,"run_storage").value="Off";reloaded.__h3ContinuumProductionUxRefresh();
   assert(buttons.every(name=>!visible(reloaded,name)),"storage off does not expose review actions");
+  // Hotfix: stale saved review cannot offer/submit Retry after settings edits.
+  const edited=makeNode();w(edited,"chunks").value=4;
+  const originalProject=state("review_ready",{start:2,end:2,physical_group:2},"edit-base");
+  await load(edited,originalProject);
+  const oldSeed=w(edited,"base_seed").value;
+  w(edited,"Try this chunk again").callback();
+  w(edited,"Back to Settings").callback();
+  w(edited,"base_seed").value=999;w(edited,"base_seed").callback?.(999);
+  assert.match(reviewStatus(edited),/Settings changed/);
+  w(edited,"Return to Review").callback();
+  assert(buttons.every(name=>!visible(edited,name)),"stale review actions hidden");
+  assert(visible(edited,"Start again from Chunk 1")&&visible(edited,"Render History"));
+  await load(edited,originalProject);
+  assert.match(reviewStatus(edited),/Settings changed/,"history refresh must not bless edits");
+  const changedInputs={base_seed:999};prepareReviewQueueIntent(edited,changedInputs);
+  assert.equal(changedInputs.review_action,"Continue / Next");
+  assert.equal(changedInputs.base_seed,999);
+  assert.deepEqual(project,originalProject,"stored backend state is untouched");
+  w(edited,"base_seed").value=oldSeed;edited.__h3ContinuumProductionUxRefresh();
+  assert(visible(edited,"Try this chunk again"),"undo restores the original review eligibility");
+  // Manual boundaries are not silently erased by old action callbacks.
+  w(edited,"reroll_from_chunk").value="Chunk 1";
+  w(edited,"Try this chunk again").callback();
+  assert.equal(w(edited,"reroll_from_chunk").value,"Chunk 1");
+  const manualInputs={reroll_from_chunk:"Chunk 1"};prepareReviewQueueIntent(edited,manualInputs);
+  assert.equal(manualInputs.reroll_from_chunk,"Chunk 1");
+  assert.equal(manualInputs.review_action,"Continue / Next");
+  // Restart uses existing non-destructive branch controls, consumed once.
+  w(edited,"reroll_nonce").value=8;
+  w(edited,"Start again from Chunk 1").callback();
+  assert.equal(w(edited,"reroll_nonce").value,0);
+  assert.equal(w(edited,"take_action").value,"Automatic");
+  const restartInputs={reroll_from_chunk:w(edited,"reroll_from_chunk").value};
+  prepareReviewQueueIntent(edited,restartInputs);
+  w(edited,"review_action").afterQueued({isPartialExecution:false});
+  assert.equal(restartInputs.reroll_from_chunk,"Chunk 1","queued restart payload unchanged");
+  assert.equal(w(edited,"reroll_from_chunk").value,"Auto","next Queue can continue");
+  assert.equal(w(edited,"base_seed").value,oldSeed);
+  assert.equal(edited.serialize().widgets_values.length,makeNode().serialize().widgets_values.length);
+  // Linked prompts, media selection/bypass and reconnection are included.
+  const upstream={id:71,comfyClass:"LoadImage",mode:0,inputs:[],widgets:[{name:"image",value:"first.png"}]};
+  const graph={links:{9:{origin_id:71,origin_slot:0}},getNodeById:id=>id===71?upstream:null};
+  const linked=makeNode();linked.graph=graph;linked.inputs=[{name:"reference_image_1",link:9}];
+  await load(linked,state("review_ready",{start:1,end:1,physical_group:1},"linked"));
+  for(const mutation of [()=>upstream.widgets[0].value="second.png",()=>upstream.mode=4,()=>linked.inputs[0].link=null]){
+    mutation();linked.onDrawForeground();
+    assert.match(reviewStatus(linked),/Settings changed/);
+    assert(!visible(linked,"Try this chunk again"));
+    upstream.widgets[0].value="first.png";upstream.mode=0;linked.inputs[0].link=9;
+    linked.onDrawForeground();assert(visible(linked,"Try this chunk again"));
+  }
+  upstream.comfyClass="PrimitiveStringMultiline";upstream.widgets=[{name:"value",value:"old prompt"}];
+  await load(linked,state("review_ready",{start:1,end:1,physical_group:1},"prompt-base"));
+  upstream.widgets[0].value="new prompt";linked.onDrawForeground();
+  assert.match(reviewStatus(linked),/Settings changed/);
+  // Edits made while a queued run is working must remain dirty on completion.
+  const flight=makeNode();prepareReviewQueueIntent(flight,{});
+  w(flight,"base_seed").value=321;
+  await load(flight,state("review_ready",{start:1,end:1,physical_group:1},"flight"));
+  assert.match(reviewStatus(flight),/Settings changed/);
+  assert(!visible(flight,"Try this chunk again"));
+  // A slow first history response cannot bless settings changed during fetch.
+  const slow=makeNode();await load(slow,null);
+  const normalFetch=globalThis.fetch;let releaseFetch;
+  globalThis.fetch=()=>new Promise(resolve=>{releaseFetch=resolve;});
+  const pendingHistory=loadTakeHistory(slow);
+  w(slow,"base_seed").value=456;
+  releaseFetch({ok:true,status:200,json:async()=>state("review_ready",{start:1,end:1,physical_group:1},"slow")});
+  await pendingHistory;
+  assert.match(reviewStatus(slow),/Settings changed/);
+  globalThis.fetch=normalFetch;
+  // An old queued snapshot cannot become another Run Name's baseline.
+  const otherRun=makeNode();prepareReviewQueueIntent(otherRun,{});
+  w(otherRun,"run_name").value="different-run";w(otherRun,"base_seed").value=789;
+  await load(otherRun,state("review_ready",{start:1,end:1,physical_group:1},"other-run"));
+  assert(!reviewSettingsChanged(otherRun));
   console.log("PASS: real frontend completed-review lifecycle");
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''

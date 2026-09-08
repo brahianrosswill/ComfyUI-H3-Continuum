@@ -278,6 +278,7 @@ const RUN_STORAGE_WIDGET = "run_storage";
 const GENERATION_MODE_WIDGET = "generation_mode";
 const REVIEW_ACTION_WIDGET = "review_action";
 const GENERATION_MODE_FULL_RUN = "Full Run";
+const REGENERATE_WIDGET = "reroll_from_chunk";
 const GENERATION_MODE_REVIEW = "Review Each Chunk";
 const REVIEW_ACTION_CONTINUE = "Continue / Next";
 const REVIEW_ACTION_REGENERATE = "Regenerate Current";
@@ -652,6 +653,7 @@ const PRODUCTION_REGENERATE_WIDGET = "Try this chunk again";
 const PRODUCTION_FINISH_WIDGET = "Use it and finish the rest";
 const PRODUCTION_BACK_TO_SETTINGS_WIDGET = "Back to Settings";
 const PRODUCTION_RETURN_TO_REVIEW_WIDGET = "Return to Review";
+const PRODUCTION_RESTART_WIDGET = "Start again from Chunk 1";
 const FACADE_READY_WIDGET = "Ready to Queue";
 const FACADE_ADVANCED_WIDGET = "Advanced Settings";
 const FACADE_REFERENCE_SIZE_WIDGET = "Reference Image Size";
@@ -679,7 +681,7 @@ function makeNode() {{
         widgets: [
             widget("unrelated", 73),
             widget(RUN_STORAGE_WIDGET, "Off"),
-            widget(REGENERATE_WIDGET, "Chunk 2"),
+            widget(REGENERATE_WIDGET, "Auto"),
             widget(REROLL_NONCE_WIDGET, 7),
             widget(GENERATION_MODE_WIDGET, GENERATION_MODE_FULL_RUN),
             widget(REVIEW_ACTION_WIDGET, REVIEW_ACTION_CONTINUE),
@@ -726,7 +728,7 @@ const continued = {{
     plan: findWidget(node, PRODUCTION_STATUS_WIDGET).value,
 }};
 
-setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Chunk 2");
+setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Auto");
 findWidget(node, PRODUCTION_REGENERATE_WIDGET).callback();
 const regenerateInputs = {{ unrelated: "preserved" }};
 prepareReviewQueueIntent(node, regenerateInputs);
@@ -797,7 +799,7 @@ console.log(JSON.stringify({{
     observed = json.loads(result.stdout)
 
     assert observed["basic"] == {
-        "totalWidgets": 21,
+        "totalWidgets": 22,
         "transientHidden": True,
         "saved": observed["originalValues"],
     }
@@ -848,8 +850,8 @@ console.log(JSON.stringify({{
     assert len(observed["saved"]["widgets_values"]) == len(observed["originalValues"])
     assert observed["reload"] == {
         "values": observed["saved"]["widgets_values"],
-        "totalWidgets": 21,
-        "transientCount": 12,
+        "totalWidgets": 22,
+        "transientCount": 13,
     }
 
 

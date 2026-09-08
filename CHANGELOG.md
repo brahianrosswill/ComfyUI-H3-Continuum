@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.8.0 — Review UI hotfix on main (2026-09-08)
+
+- Withdraw stale Continue/Retry/Finish actions after local or connected generation inputs change. A stale queued Retry falls back to normal backend compatibility/reuse checks instead of targeting an incompatible saved review.
+- Add the frontend-only `Start again from Chunk 1` action: use existing non-destructive branch controls, preserve saved Takes, and consume the restart selection once after Queue.
+- Preserve explicit Regenerate From boundaries instead of resetting them when a Review action is clicked. Preserve normal continuation, completed review, history and serialized widget order.
+- No sampling, audio, continuation transport, workflow or public Python schema change. The separate 15-second Review static/noise report remains unresolved. This main-branch hotfix is not a new Registry publication or release asset.
+
 ## 3.8.0
 
 ### Added

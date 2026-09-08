@@ -2,6 +2,8 @@
 
 **Download workflow: [JSON](examples/workflows/MiniMax_H3_Continuum_V38.json) | [ZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip)** — [Latest release](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum/releases/latest)
 
+**Review UI hotfix on `main` — September 8, 2026:** Changed settings no longer offer a stale chunk Retry. Use **Start again from Chunk 1**, then Queue, to restart with the current settings while keeping saved Takes. The restart selection is consumed once so the next Queue can continue normally. Update with the `git pull` command below, restart ComfyUI, and reload the browser page (hard-refresh if the old UI remains). The workflow files and generation engine are unchanged. **The separate report of static/noise in the second 15-second Review chunk is still under investigation; this hotfix does not claim to fix it.**
+
 <img width="1536" height="1024" alt="exec-55ad0463-8655-409c-b9a6-49d1315cdd78" src="https://github.com/user-attachments/assets/063bb16b-5c25-44f8-9304-031995502b26" />
 
 
@@ -206,6 +208,7 @@ When `Run = Review Each Chunk`, `Progress` is On, and a review unit is ready, th
 |---|---|
 | `Use it and continue` | Accepts the current result, reuses it, and generates one next physical group |
 | `Try this chunk again` | Keeps the earlier accepted prefix and creates another Take of the current review unit |
+| `Start again from Chunk 1` | Selects a fresh branch from Chunk 1 with current settings and automatic variation; press Queue afterward. Saved Takes are kept. The selection resets to Auto after Queue |
 | `Use it and finish the rest` | Accepts the current result and generates every remaining group without further review pauses |
 | `Back to Settings` | Shows the normal settings; does not queue, reset, or discard the review |
 | `Return to Review` | Returns from settings to the pending review; does not undo edited values |
@@ -381,6 +384,8 @@ Use this when the **chunk currently being reviewed** is the one you want to repl
 ![Try this chunk again selected; the top-right Run button executes the retry](docs/images/v38-manual/live-retry-selected.png)
 
 To replace an earlier chunk after moving past it, use [Render History](#7-choose-an-earlier-take-or-branch-from-it) or [Regenerate From](#8-regenerate-from-a-particular-chunk), not the current-chunk retry button.
+
+If you change the seed, prompt, references or other generation inputs after a review, the panel shows **Settings changed** and withdraws the old Continue/Retry/Finish actions. Queue the current settings for the backend to decide compatible reuse, or select **Start again from Chunk 1** and then Queue for an explicit restart. This is non-destructive: existing Takes remain in Render History. If you manually select `Regenerate From = Chunk N`, press Queue directly; Review buttons no longer discard that boundary.
 
 #### 5. Keep the result and finish everything remaining
 

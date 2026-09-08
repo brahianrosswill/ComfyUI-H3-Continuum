@@ -59,6 +59,7 @@ const PRODUCTION_REGENERATE_WIDGET = "Try this chunk again";
 const PRODUCTION_FINISH_WIDGET = "Use it and finish the rest";
 const PRODUCTION_BACK_TO_SETTINGS_WIDGET = "Back to Settings";
 const PRODUCTION_RETURN_TO_REVIEW_WIDGET = "Return to Review";
+const PRODUCTION_RESTART_WIDGET = "Start again from Chunk 1";
 const TAKE_STATUS_WIDGET = "Render History / Takes";
 const TAKE_TOGGLE_WIDGET = "Render History";
 const TAKE_PREVIOUS_WIDGET = "Previous Take";
@@ -1318,6 +1319,69 @@ function canonicalStorageRevision(project) {
     return revisions.find((item) => String(item?.revision_id || "") === revisionId) || null;
 }
 
+// Browser edit detection is advisory: it can withdraw stale actions, never
+// approve a saved prefix. Run Storage still owns all compatibility/reuse checks.
+function reviewSettingsSnapshot(node) {
+    const ignored = new Set([
+        PROJECT_WIDGET, LEGACY_RUN_NAME_WIDGET, RUN_STORAGE_WIDGET,
+        GENERATION_MODE_WIDGET, REVIEW_ACTION_WIDGET, REGENERATE_WIDGET,
+        REROLL_NONCE_WIDGET, TAKE_GROUP_WIDGET, TAKE_REVISION_WIDGET,
+        TAKE_ACTION_WIDGET, "control_after_generate", "diagnostics", "debug",
+        "strict_compatibility", "show_preview",
+    ]);
+    const seen = new Set();
+    const visit = (current) => {
+        if (!current || seen.has(current)) return null;
+        seen.add(current);
+        const widgets = (current.widgets || []).filter((widget) => (
+            !widget[PRODUCTION_TRANSIENT_WIDGET] && !widget[FACADE_TRANSIENT_WIDGET]
+            && widget.options?.serialize !== false && widget.type !== "button"
+            && !(current === node && ignored.has(widget.name))
+        )).map((widget) => [widget.name, widget.value])
+            .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+        const graph = node.graph || (typeof app === "undefined" ? null : app.graph);
+        const inputs = (current.inputs || []).map((input) => {
+            const link = graph?.links?.[input.link];
+            return [input.name, input.link, link?.origin_slot,
+                visit(graph?.getNodeById?.(link?.origin_id))];
+        });
+        return [current.id, current.comfyClass || current.type, current.mode, widgets, inputs];
+    };
+    try { return JSON.stringify(visit(node)); } catch { return null; }
+}
+
+function reviewSettingsChanged(node) {
+    const baseline = node.__h3ContinuumReviewedSettings;
+    const current = reviewSettingsSnapshot(node);
+    return baseline != null && current != null && current !== baseline;
+}
+
+function rememberReviewSettings(node, requestedSettings) {
+    const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
+    if (!revision || !["review_ready", "complete"].includes(revision.status)) return;
+    const key = JSON.stringify([takeRunName(node), revision.revision_id,
+        revision.status, revision.review_unit, revision.updated_utc]);
+    if (key === node.__h3ContinuumReviewedSettingsKey) return;
+    node.__h3ContinuumReviewedSettingsKey = key;
+    // Keep edits made during generation dirty against what was actually queued.
+    const queued = node.__h3ContinuumQueuedSettingsRun === takeRunName(node)
+        ? node.__h3ContinuumQueuedSettings : null;
+    node.__h3ContinuumReviewedSettings = queued
+        ?? requestedSettings ?? reviewSettingsSnapshot(node);
+    delete node.__h3ContinuumQueuedSettings;
+    delete node.__h3ContinuumQueuedSettingsRun;
+}
+
+function selectProductionRestart(node) {
+    clearTakeSelection(node);
+    setExistingWidgetValue(findWidget(node, REVIEW_ACTION_WIDGET), REVIEW_ACTION_CONTINUE);
+    setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
+    setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Chunk 1");
+    delete node[REVIEW_UI_SELECTION];
+    node.__h3ContinuumRestartSelected = true;
+    node.__h3ContinuumProductionUxRefresh?.();
+}
+
 function reviewReady(node) {
     const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
     // Completion ends continuation, not the user's ability to inspect/retry a Take.
@@ -1337,6 +1401,13 @@ function reviewHasUnit(node) {
 function reviewStatus(node) {
     if (node.__h3ContinuumTakeError) {
         return `Review status unavailable: ${node.__h3ContinuumTakeError}`;
+    }
+    const from = findWidget(node, REGENERATE_WIDGET)?.value;
+    if (from && from !== "Auto" && from !== 0) {
+        return `Regenerate from ${from}\nPress Queue directly. Saved Takes are kept.`;
+    }
+    if (reviewSettingsChanged(node)) {
+        return "Settings changed — previous review is out of date\nQueue current settings, or start again from Chunk 1. Saved Takes are kept.";
     }
     const project = node.__h3ContinuumTakeProject;
     if (!project) return "Queue the workflow to create the first chunk.";
@@ -1380,7 +1451,11 @@ function reviewStatus(node) {
 }
 
 function selectProductionReviewAction(node, action) {
-    setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Auto");
+    const from = findWidget(node, REGENERATE_WIDGET)?.value;
+    if (reviewSettingsChanged(node) || (from && from !== "Auto" && from !== 0)) {
+        node.__h3ContinuumProductionUxRefresh?.();
+        return;
+    }
     setExistingWidgetValue(findWidget(node, RUN_STORAGE_WIDGET), "Save + Auto Resume");
     setExistingWidgetValue(findWidget(node, GENERATION_MODE_WIDGET), GENERATION_MODE_REVIEW);
     setReviewSeedControlFixed(node);
@@ -1655,6 +1730,7 @@ function clearTakeSelection(node) {
 
 async function loadTakeHistory(node) {
     const runName = takeRunName(node);
+    const requestedSettings = node.__h3ContinuumReadReviewSettings?.();
     if (!runName || typeof globalThis.fetch !== "function") {
         node.__h3ContinuumTakeProject = null;
         delete node.__h3ContinuumTakeError;
@@ -1689,6 +1765,7 @@ async function loadTakeHistory(node) {
             throw new Error("Branch Provenance v1 is unavailable");
         }
         node.__h3ContinuumTakeProject = project;
+        node.__h3ContinuumRememberReviewSettings?.(requestedSettings);
         delete node.__h3ContinuumTakeError;
         if (legacyV2) {
             clearTakeSelection(node);
@@ -1730,9 +1807,10 @@ async function loadTakeHistory(node) {
     }
 }
 
-function refreshV38TakeHistoryAfterExecution() {
+function refreshV38TakeHistoryAfterExecution(event) {
     for (const node of app.graph?._nodes || []) {
         if (node.comfyClass !== V38_NODE_CLASS) continue;
+        if (event?.type !== "execution_success") delete node.__h3ContinuumQueuedSettings;
         void loadTakeHistory(node);
         setTimeout(() => void loadTakeHistory(node), 250);
     }
@@ -1838,6 +1916,15 @@ function configureProductionReviewUx(node) {
                 "Return to the pending chunk review without changing any settings or Take state."
             ));
         }
+        const restart = addTransientProductionWidget(
+            node, "button", PRODUCTION_RESTART_WIDGET, null,
+            () => selectProductionRestart(node),
+        );
+        if (restart) setWidgetTooltip(restart, (
+            "Select a new branch from Chunk 1 using the current settings and automatic "
+            + "Take variation. Press Queue afterward. Saved Takes are not deleted; "
+            + "the restart selection is consumed once after Queue."
+        ));
         const historyToggle = addTransientProductionWidget(
             node,
             "button",
@@ -1944,6 +2031,9 @@ function configureProductionReviewUx(node) {
         }
         const settingsOpen = ready && Boolean(node.__h3ContinuumReviewSettingsOpen);
         const reviewOpen = ready && !settingsOpen;
+        const from = findWidget(node, REGENERATE_WIDGET)?.value;
+        const edited = reviewSettingsChanged(node);
+        const canReview = !edited && (!from || from === "Auto" || from === 0);
         const takeCount = takeCatalog(node).length;
         const actionNames = new Set([
             PRODUCTION_STATUS_WIDGET,
@@ -1963,18 +2053,20 @@ function configureProductionReviewUx(node) {
             if (widget.name === PRODUCTION_STATUS_WIDGET) {
                 setWidgetVisible(widget, reviewOpen);
             } else if (widget.name === PRODUCTION_REGENERATE_WIDGET) {
-                setWidgetVisible(widget, reviewOpen && reviewHasUnit(node));
+                setWidgetVisible(widget, reviewOpen && canReview && reviewHasUnit(node));
             } else if (
                 widget.name === PRODUCTION_CONTINUE_WIDGET
                 || widget.name === PRODUCTION_FINISH_WIDGET
             ) {
-                setWidgetVisible(widget, reviewOpen && !complete);
+                setWidgetVisible(widget, reviewOpen && canReview && !complete);
             } else if (actionNames.has(widget.name)) {
                 setWidgetVisible(widget, reviewOpen);
             } else if (widget.name === PRODUCTION_BACK_TO_SETTINGS_WIDGET) {
                 setWidgetVisible(widget, reviewOpen);
             } else if (widget.name === PRODUCTION_RETURN_TO_REVIEW_WIDGET) {
                 setWidgetVisible(widget, settingsOpen);
+            } else if (widget.name === PRODUCTION_RESTART_WIDGET) {
+                setWidgetVisible(widget, ready);
             } else if (widget.name === TAKE_TOGGLE_WIDGET) {
                 setWidgetVisible(widget, reviewOpen && takeCount > 0);
             } else if (historyNames.has(widget.name)) {
@@ -2044,6 +2136,7 @@ function configureProductionReviewUx(node) {
                     PRODUCTION_REGENERATE_WIDGET,
                     PRODUCTION_FINISH_WIDGET,
                     PRODUCTION_BACK_TO_SETTINGS_WIDGET,
+                    PRODUCTION_RESTART_WIDGET,
                     TAKE_TOGGLE_WIDGET,
                     TAKE_STATUS_WIDGET,
                     TAKE_PREVIOUS_WIDGET,
@@ -2072,6 +2165,7 @@ function configureProductionReviewUx(node) {
                 readyIndex >= 0 ? readyIndex + 1 : settingsOrder.length,
                 0,
                 PRODUCTION_RETURN_TO_REVIEW_WIDGET,
+                PRODUCTION_RESTART_WIDGET,
             );
             moveNamedWidgetsToFront(node, settingsOrder);
         } else if (Array.isArray(node.__h3ContinuumFacadeOrder)) {
@@ -2080,6 +2174,28 @@ function configureProductionReviewUx(node) {
         node.setDirtyCanvas?.(true, true);
     };
     node.__h3ContinuumProductionUxRefresh = refresh;
+    node.__h3ContinuumReviewSettingsChanged = () => reviewSettingsChanged(node);
+    node.__h3ContinuumRememberReviewSettings = (requested) => rememberReviewSettings(node, requested);
+    node.__h3ContinuumReadReviewSettings = () => reviewSettingsSnapshot(node);
+    node.__h3ContinuumCaptureReviewSettings = () => {
+        node.__h3ContinuumQueuedSettings = reviewSettingsSnapshot(node);
+        node.__h3ContinuumQueuedSettingsRun = takeRunName(node);
+    };
+    // Upstream prompt/media edits also invalidate review, not just local widgets.
+    if (!node.__h3ContinuumReviewDrawWatch) {
+        const previous = node.onDrawForeground;
+        node.onDrawForeground = function(...args) {
+            const result = previous?.apply(this, args);
+            const changed = reviewSettingsChanged(this);
+            if (changed !== this.__h3ContinuumReviewDrawChanged) {
+                this.__h3ContinuumReviewDrawChanged = changed;
+                this.__h3ContinuumIntuitiveUxRefresh?.();
+                this.__h3ContinuumProductionUxRefresh?.();
+            }
+            return result;
+        };
+        node.__h3ContinuumReviewDrawWatch = true;
+    }
     for (const [name, key] of (
         [
             [RUN_STORAGE_WIDGET, "__h3ContinuumProductionStorageRefresh"],
@@ -2095,6 +2211,11 @@ function configureProductionReviewUx(node) {
         attachRefresh(findWidget(node, name), key, refresh);
     }
     attachTakeHistoryReload(node);
+    for (const widget of node.widgets || []) {
+        if (!widget[PRODUCTION_TRANSIENT_WIDGET] && !widget[FACADE_TRANSIENT_WIDGET]) {
+            attachRefresh(widget, "__h3ContinuumReviewEditRefresh", refresh);
+        }
+    }
     refresh();
 }
 
@@ -2391,15 +2512,29 @@ function prepareReviewQueueIntent(node, apiInputs) {
     }
     const generationMode = generationWidget.value;
     const selectedAction = actionWidget.value;
-    const submittedAction = generationMode === GENERATION_MODE_FULL_RUN
+    const from = findWidget(node, REGENERATE_WIDGET)?.value;
+    const staleReview = node.__h3ContinuumReviewSettingsChanged?.() || false;
+    const manualRegenerate = from && from !== "Auto" && from !== 0;
+    const submittedAction = generationMode === GENERATION_MODE_FULL_RUN || staleReview || manualRegenerate
         ? REVIEW_ACTION_CONTINUE
         : selectedAction;
+    if (staleReview || manualRegenerate) {
+        actionWidget.value = REVIEW_ACTION_CONTINUE;
+        delete node[REVIEW_UI_SELECTION];
+    }
     apiInputs[GENERATION_MODE_WIDGET] = generationMode;
     apiInputs[REVIEW_ACTION_WIDGET] = submittedAction;
     const takeAction = findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
     apiInputs[TAKE_GROUP_WIDGET] = Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
     apiInputs[TAKE_REVISION_WIDGET] = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
     apiInputs[TAKE_ACTION_WIDGET] = takeAction;
+    node.__h3ContinuumCaptureReviewSettings?.();
+    if (node.__h3ContinuumRestartSelected && from === "Chunk 1") {
+        node.__h3ContinuumRestartQueued = true;
+    } else {
+        delete node.__h3ContinuumRestartSelected;
+        delete node.__h3ContinuumRestartQueued;
+    }
     if (
         generationMode === GENERATION_MODE_REVIEW
         && isOneShotReviewAction(submittedAction)
@@ -2462,6 +2597,15 @@ function configureReviewControls(node) {
             const result = previous?.apply(this, args);
             resetReviewActionAfterQueued(node);
             resetTakeActionAfterQueued(node);
+            if (node.__h3ContinuumRestartQueued) {
+                delete node.__h3ContinuumRestartQueued;
+                delete node.__h3ContinuumRestartSelected;
+                const from = findWidget(node, REGENERATE_WIDGET);
+                if (from?.value === "Chunk 1") {
+                    from.value = "Auto";
+                    from.callback?.("Auto");
+                }
+            }
             return result;
         };
         actionWidget.__h3ContinuumReviewAfterQueued = true;
