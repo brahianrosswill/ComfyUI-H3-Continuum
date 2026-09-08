@@ -191,9 +191,18 @@ def test_intuitive_facade_is_discoverable_and_presentation_only(tmp_path):
     ).replace(
         'import { normalizeReferenceAudioLabels } from "./reference_audio_ui.js";',
         "function normalizeReferenceAudioLabels() {}",
+    ).replace(
+        'import { api } from "../../scripts/api.js";',
+        "const api = { fetchApi: (...args) => globalThis.fetch(...args), "
+        "addEventListener(name, callback) { "
+        "const listeners = terminalListeners.get(name) || []; "
+        "listeners.push(callback); terminalListeners.set(name, listeners); }, "
+        "queuePrompt: async () => ({prompt_id: 'facade-queue'}) };",
     )
     script = f"""
 globalThis.__extension = null;
+const terminalListeners = new Map();
+let savedProject = null;
 const sourceNodes = {{
   101: {{ id: 101, mode: 0, widgets: [{{ name: "Enable Image", value: true }}] }},
   102: {{ id: 102, mode: 0, widgets: [{{ name: "Enable Video", value: true }}] }},
@@ -212,7 +221,9 @@ globalThis.__app = {{
   ui: {{ settings: {{ getSettingValue: (_id, fallback) => fallback, addSetting() {{}} }} }},
   registerExtension(extension) {{ globalThis.__extension = extension; }},
 }};
-globalThis.fetch = async () => ({{ status: 404, ok: false }});
+globalThis.fetch = async () => savedProject
+  ? {{status: 200, ok: true, json: async () => structuredClone(savedProject)}}
+  : {{status: 404, ok: false}};
 {source}
 function widget(name, value) {{
   return {{
@@ -222,6 +233,7 @@ function widget(name, value) {{
   }};
 }}
 const node = {{
+  id: 312,
   comfyClass: "H3ContinuumSamplerV38",
   properties: {{ "H3 Continuum View": "Basic" }},
   widgets: [
@@ -277,7 +289,8 @@ const node = {{
 }};
 globalThis.__app.graph._nodes.push(node);
 globalThis.__extension.nodeCreated(node);
-setTimeout(() => {{
+globalThis.__extension.setup();
+setTimeout(async () => {{
   const savedBefore = node.serialize().widgets_values;
   const facade = Object.fromEntries([
     "Prompt Format", "Continuity", "Base Seed", "Control After Generate", "Audio Continuity",
@@ -364,8 +377,19 @@ setTimeout(() => {{
   const historyHiddenBeforeTake = node.widgets.find(
     (item) => item.name === "Render History",
   ).hidden;
-  prepareReviewQueueIntent(node, {{}});
-  node.__h3ContinuumTakeProject = {{
+  // Queue ordinary continuation through the supported lifecycle. Do not call
+  // the removed setup helper or fabricate completion directly on the node.
+  node.widgets.find((item) => item.name === "reroll_from_chunk").value = "Auto";
+  for (const widget of node.widgets) widget.beforeQueued?.({{isPartialExecution:false}});
+  const submitted = {{}};
+  for (const [index, widget] of node.widgets.entries()) {{
+    if (widget.options?.serialize === false) continue;
+    submitted[widget.name] = widget.serializeValue
+      ? await widget.serializeValue(node, index) : widget.value;
+  }}
+  await api.queuePrompt(0, {{output: {{312: {{class_type:node.comfyClass, inputs:submitted}}}}}});
+  for (const widget of node.widgets) widget.afterQueued?.({{isPartialExecution:false}});
+  savedProject = {{
     branch_provenance_version: 1,
     canonical_storage_revision_id: "storage-ready",
     revisions: [{{
@@ -379,9 +403,9 @@ setTimeout(() => {{
       group: {{ start: 1, end: 1, physical_group: 1 }},
     }}],
   }};
-  finishModeSetupAfterExecution(node);
-  node.__h3ContinuumRememberReviewSettings(); // The queued generation completed.
-  node.__h3ContinuumProductionUxRefresh();
+  for (const listener of terminalListeners.get("execution_success") || []) {{
+    await listener({{type:"execution_success",detail:{{prompt_id:"facade-queue"}}}});
+  }}
   const reviewButtonsVisibleWhenReady = [
     "Use it and continue", "Try this chunk again", "Use it and finish the rest",
   ].every((name) => !node.widgets.find((item) => item.name === name).hidden);

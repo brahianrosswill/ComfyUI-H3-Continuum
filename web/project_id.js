@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { normalizeReferenceAudioLabels } from "./reference_audio_ui.js";
 
 const PRODUCTION_NODE_CLASS = "H3ContinuumSamplerProduction";
@@ -60,6 +61,7 @@ const PRODUCTION_FINISH_WIDGET = "Use it and finish the rest";
 const PRODUCTION_BACK_TO_SETTINGS_WIDGET = "Back to Settings";
 const PRODUCTION_RETURN_TO_REVIEW_WIDGET = "Return to Review";
 const PRODUCTION_RESTART_WIDGET = "Start again from Chunk 1";
+const PRODUCTION_OUTPUT_RETRY_WIDGET = "Retry saved output";
 const TAKE_STATUS_WIDGET = "Render History / Takes";
 const TAKE_TOGGLE_WIDGET = "Render History";
 const TAKE_PREVIOUS_WIDGET = "Previous Take";
@@ -421,107 +423,6 @@ function installProductionSerializationGuard(node) {
     node.__h3ContinuumProductionSerializationGuard = true;
 }
 
-function reviewModeSetupActive(node) {
-    return (
-        node?.comfyClass === V38_NODE_CLASS
-        && Boolean(node.__h3ContinuumModeSetup)
-        && findWidget(node, GENERATION_MODE_WIDGET)?.value === GENERATION_MODE_REVIEW
-    );
-}
-
-function installReviewModeSetupQueueContract(node) {
-    if (node.__h3ContinuumModeSetupQueueContract) return;
-    const generationWidget = findWidget(node, GENERATION_MODE_WIDGET);
-    if (!generationWidget) return;
-
-    // ComfyUI frontend 1.49 calls widget.beforeQueued before serializeValue.
-    // Mode selection is presentation/setup only: it must never inject a hidden
-    // Chunk 1 restart. History selection is also cleared from a normal mode
-    // setup so Run Storage remains the authority for compatible prefix reuse.
-    const setupOverrides = new Map([
-        [REVIEW_ACTION_WIDGET, REVIEW_ACTION_CONTINUE],
-        [TAKE_GROUP_WIDGET, 0],
-        [TAKE_REVISION_WIDGET, ""],
-        [TAKE_ACTION_WIDGET, TAKE_ACTION_AUTOMATIC],
-    ]);
-    for (const [name, value] of setupOverrides) {
-        const widget = findWidget(node, name);
-        if (!widget || widget.__h3ContinuumModeSetupSerializeValue) continue;
-        const previous = widget.serializeValue;
-        widget.serializeValue = function(...args) {
-            if (reviewModeSetupActive(node)) return value;
-            return typeof previous === "function"
-                ? previous.apply(this, args)
-                : this.value;
-        };
-        widget.__h3ContinuumModeSetupSerializeValue = true;
-    }
-
-    const regenerateWidget = findWidget(node, REGENERATE_WIDGET);
-    if (regenerateWidget && !regenerateWidget.__h3ContinuumSafeSerializeValue) {
-        const previous = regenerateWidget.serializeValue;
-        regenerateWidget.serializeValue = function(...args) {
-            if (findWidget(node, RUN_STORAGE_WIDGET)?.value !== "Save + Auto Resume") {
-                return "Auto";
-            }
-            if (
-                reviewModeSetupActive(node)
-                && this.value === "Chunk 1"
-                && !node.__h3ContinuumManualRegenerateIntent
-                && !node.__h3ContinuumRestartSelected
-            ) {
-                return "Auto";
-            }
-            return typeof previous === "function"
-                ? previous.apply(this, args)
-                : this.value;
-        };
-        regenerateWidget.__h3ContinuumSafeSerializeValue = true;
-    }
-    const nonceWidget = findWidget(node, REROLL_NONCE_WIDGET);
-    if (nonceWidget && !nonceWidget.__h3ContinuumSafeSerializeValue) {
-        const previous = nonceWidget.serializeValue;
-        nonceWidget.serializeValue = function(...args) {
-            if (findWidget(node, RUN_STORAGE_WIDGET)?.value !== "Save + Auto Resume") {
-                return 0;
-            }
-            if (
-                reviewModeSetupActive(node)
-                && regenerateWidget?.value === "Chunk 1"
-                && !node.__h3ContinuumManualRegenerateIntent
-                && !node.__h3ContinuumRestartSelected
-            ) {
-                return 0;
-            }
-            return typeof previous === "function"
-                ? previous.apply(this, args)
-                : this.value;
-        };
-        nonceWidget.__h3ContinuumSafeSerializeValue = true;
-    }
-
-    const previousBeforeQueued = generationWidget.beforeQueued;
-    generationWidget.beforeQueued = function(...args) {
-        const result = previousBeforeQueued?.apply(this, args);
-        normalizeRunStorageState(node);
-        if (reviewModeSetupActive(node)) {
-            normalizeUnownedRestart(node);
-            const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
-            node.__h3ContinuumModeSetupQueued = {
-                setup: node.__h3ContinuumModeSetup,
-                runName: takeRunName(node),
-                baselineRevision: String(revision?.revision_id || ""),
-            };
-            node.__h3ContinuumQueuedSettings = reviewSettingsSnapshot(node);
-            node.__h3ContinuumQueuedSettingsRun = takeRunName(node);
-        } else {
-            delete node.__h3ContinuumModeSetupQueued;
-        }
-        return result;
-    };
-    node.__h3ContinuumModeSetupQueueContract = true;
-}
-
 function addTransientProductionWidget(node, type, name, value, callback, options = {}) {
     if (typeof node.addWidget !== "function") return null;
     const widget = node.addWidget(
@@ -547,12 +448,7 @@ function setExistingWidgetValue(widget, value) {
 
 function setRegenerateProgrammatically(node, value) {
     const widget = findWidget(node, REGENERATE_WIDGET);
-    if (!widget || widget.value === value) {
-        if (value === "Auto" || value === 0 || value == null) {
-            delete node.__h3ContinuumManualRegenerateIntent;
-        }
-        return;
-    }
+    if (!widget) return;
     node.__h3ContinuumProgrammaticRegenerate = true;
     try {
         setExistingWidgetValue(widget, value);
@@ -564,18 +460,22 @@ function setRegenerateProgrammatically(node, value) {
     }
 }
 
-function normalizeUnownedRestart(node) {
-    const widget = findWidget(node, REGENERATE_WIDGET);
+function repairStaleReviewRegenerate(node, project) {
+    const revision = canonicalStorageRevision(project);
     if (
-        widget?.value === "Chunk 1"
-        && !node.__h3ContinuumManualRegenerateIntent
-        && !node.__h3ContinuumRestartSelected
+        !revision
+        || !["review_ready", "complete"].includes(revision.status)
+        || activeReviewPrompt(node)
+        || node.__h3ContinuumManualRegenerateIntent
+        || node.__h3ContinuumRestartSelected
     ) {
-        setRegenerateProgrammatically(node, "Auto");
-        setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
-        return true;
+        return false;
     }
-    return false;
+    const widget = findWidget(node, REGENERATE_WIDGET);
+    if (!widget || widget.value === "Auto" || widget.value === 0) return false;
+    setRegenerateProgrammatically(node, "Auto");
+    setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
+    return true;
 }
 
 function facadeProductionWidgets(node) {
@@ -805,6 +705,11 @@ function requireFixedSeedForReview(node) {
 }
 
 function readySummary(node) {
+    if (activeReviewPrompt(node)) return {headline:"Queued / generating", detail:"Waiting for this Run's saved result."};
+    if (node.__h3ContinuumOutputFailure?.runName === takeRunName(node)) return {
+        headline:"Chunk saved — output incomplete", detail:node.__h3ContinuumOutputFailure.message,
+    };
+    if (node.__h3ContinuumQueueNotice) return {headline:"Check saved progress", detail:node.__h3ContinuumQueueNotice};
     const missing = requiredConnectionNames(node);
     if (missing.length) {
         return {
@@ -1174,15 +1079,10 @@ function configureIntuitiveV38Ux(node) {
         onSet: (value, source) => {
             const reviewing = value === FACADE_GENERATE_REVIEW;
             if (reviewing && source.value !== GENERATION_MODE_REVIEW) {
-                // Selecting a mode is setup, not selecting a saved review and
-                // not a request to restart from Chunk 1.
+                // Selecting a mode is setup, not selecting a saved review.
                 node.__h3ContinuumModeSetup = {};
-                delete node.__h3ContinuumModeSetupQueued;
-                normalizeUnownedRestart(node);
             } else if (!reviewing) {
                 delete node.__h3ContinuumModeSetup;
-                delete node.__h3ContinuumModeSetupQueued;
-                normalizeUnownedRestart(node);
             }
             setExistingWidgetValue(
                 source,
@@ -1215,8 +1115,6 @@ function configureIntuitiveV38Ux(node) {
             const enabled = value === FACADE_SAVE_ON;
             setExistingWidgetValue(source, enabled ? "Save + Auto Resume" : "Off");
             if (!enabled) {
-                setRegenerateProgrammatically(node, "Auto");
-                setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
                 setExistingWidgetValue(
                     findWidget(node, GENERATION_MODE_WIDGET),
                     GENERATION_MODE_FULL_RUN,
@@ -1510,43 +1408,16 @@ function rememberReviewSettings(node, requestedSettings) {
         revision.status, revision.review_unit, revision.updated_utc]);
     if (key === node.__h3ContinuumReviewedSettingsKey) return;
     node.__h3ContinuumReviewedSettingsKey = key;
-    // Keep edits made during generation dirty against what was actually queued.
-    const queued = node.__h3ContinuumQueuedSettingsRun === takeRunName(node)
-        ? node.__h3ContinuumQueuedSettings : null;
-    node.__h3ContinuumReviewedSettings = queued
-        ?? requestedSettings ?? reviewSettingsSnapshot(node);
-    delete node.__h3ContinuumQueuedSettings;
-    delete node.__h3ContinuumQueuedSettingsRun;
-}
-
-function finishModeSetupAfterExecution(node) {
-    const queued = node.__h3ContinuumModeSetupQueued;
-    const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
-    const revisionId = String(revision?.revision_id || "");
-    if (
-        !queued
-        || queued.setup !== node.__h3ContinuumModeSetup
-        || queued.runName !== takeRunName(node)
-        || !revisionId
-        || revisionId === String(queued.baselineRevision || "")
-        || !["review_ready", "complete"].includes(revision?.status)
-    ) {
-        return false;
-    }
-    delete node.__h3ContinuumModeSetupQueued;
-    delete node.__h3ContinuumModeSetup;
-    node.__h3ContinuumIntuitiveUxRefresh?.();
-    node.__h3ContinuumProductionUxRefresh?.();
-    return true;
+    node.__h3ContinuumReviewedSettings = requestedSettings ?? reviewSettingsSnapshot(node);
 }
 
 function selectProductionRestart(node) {
     clearTakeSelection(node);
     setExistingWidgetValue(findWidget(node, REVIEW_ACTION_WIDGET), REVIEW_ACTION_CONTINUE);
     setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
-    setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Chunk 1");
-    delete node[REVIEW_UI_SELECTION];
     node.__h3ContinuumRestartSelected = true;
+    setRegenerateProgrammatically(node, "Chunk 1");
+    delete node[REVIEW_UI_SELECTION];
     node.__h3ContinuumProductionUxRefresh?.();
 }
 
@@ -1563,10 +1434,17 @@ function reviewHasUnit(node) {
     const unit = revision?.review_unit;
     return [unit?.physical_group, unit?.start, unit?.end].every(
         (value) => Number.isInteger(Number(value)) && Number(value) > 0,
-    ) && Number(unit.end) >= Number(unit.start);
+    ) && Number(unit.end) >= Number(unit.start)
+        && Number(unit.physical_group) === Number(unit.start);
 }
 
 function reviewStatus(node) {
+    const pending = activeReviewPrompt(node);
+    if (pending) return "Queued / generating\nWaiting for this Run's saved result.";
+    if (node.__h3ContinuumOutputFailure?.runName === takeRunName(node)) {
+        return "Chunk saved — output incomplete\n" + node.__h3ContinuumOutputFailure.message;
+    }
+    if (node.__h3ContinuumQueueNotice) return "Check saved progress\n" + node.__h3ContinuumQueueNotice;
     if (node.__h3ContinuumTakeError) {
         return `Review status unavailable: ${node.__h3ContinuumTakeError}`;
     }
@@ -1619,6 +1497,7 @@ function reviewStatus(node) {
 }
 
 function selectProductionReviewAction(node, action) {
+    if (activeReviewPrompt(node) || node.__h3ContinuumOutputFailure) return;
     const from = findWidget(node, REGENERATE_WIDGET)?.value;
     if (reviewSettingsChanged(node) || (from && from !== "Auto" && from !== 0)) {
         node.__h3ContinuumProductionUxRefresh?.();
@@ -1654,8 +1533,11 @@ function takeGroup(item) {
     return { physical_group: physicalGroup, start, end };
 }
 
+const takeCatalogCache = new WeakMap();
+
 function takeCatalog(node) {
     const project = node.__h3ContinuumTakeProject;
+    if (project && takeCatalogCache.has(project)) return takeCatalogCache.get(project);
     const revisions = project?.group_revisions;
     if (!Array.isArray(revisions)) return [];
     const normalized = revisions
@@ -1719,7 +1601,7 @@ function takeCatalog(node) {
         totals.set(group.physical_group, (totals.get(group.physical_group) || 0) + 1);
     }
     const positions = new Map();
-    return sorted.map(({ item, group }) => {
+    const result = sorted.map(({ item, group }) => {
         const takeNumber = (positions.get(group.physical_group) || 0) + 1;
         positions.set(group.physical_group, takeNumber);
         return {
@@ -1729,6 +1611,8 @@ function takeCatalog(node) {
             take_count: totals.get(group.physical_group),
         };
     });
+    takeCatalogCache.set(project, result);
+    return result;
 }
 
 function takeCandidates(node) {
@@ -1746,7 +1630,8 @@ function selectedTake(node) {
     const project = node.__h3ContinuumTakeProject;
     const catalog = takeCatalog(node);
     if (!project || !catalog.length) return null;
-    const selectedId = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
+    const selectedId = String(node.__h3ContinuumBrowseRevision
+        || findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
     const explicit = catalog.find((item) => item.revision_id === selectedId);
     if (explicit) return explicit;
     const requestedGroup = Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
@@ -1878,7 +1763,10 @@ function takeStatus(node) {
         lines.push("Run Storage: Off (history view only; a Take action enables storage)");
     }
     if (action !== TAKE_ACTION_AUTOMATIC) {
-        lines.push(`Next Queue: ${action} (normal Queue required)`);
+        const targetId = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
+        const target = catalog.find(item => item.revision_id === targetId);
+        lines.push(`Next Queue: ${action} — ${target ? takeLabel(target) : "selection unavailable"}`);
+        lines.push("Browsing does not change the queued selection. Press an action to apply a different Take.");
     }
     return lines.join("\n");
 }
@@ -1887,25 +1775,17 @@ function selectTakeOffset(node, offset) {
     const catalog = takeCatalog(node);
     if (!catalog.length) return;
     const current = selectedTake(node);
-    const currentIndex = Math.max(0, catalog.findIndex(
-        (item) => item.revision_id === current?.revision_id,
-    ));
+    const currentIndex = Math.max(0, catalog.findIndex(item => item.revision_id === current?.revision_id));
     const index = (currentIndex + offset + catalog.length) % catalog.length;
-    const selected = catalog[index];
-    setExistingWidgetValue(
-        findWidget(node, TAKE_GROUP_WIDGET),
-        Number(selected.group.physical_group),
-    );
-    setExistingWidgetValue(
-        findWidget(node, TAKE_REVISION_WIDGET),
-        String(selected.revision_id),
-    );
+    node.__h3ContinuumBrowseRevision = catalog[index].revision_id;
     node.__h3ContinuumProductionUxRefresh?.();
+    node.setDirtyCanvas?.(true, true);
 }
 
 function selectTakeAction(node, action) {
     const selected = selectedTake(node);
-    if (!selected) return;
+    if (!selected || reviewSettingsChanged(node) || activeReviewPrompt(node)) return;
+    delete node.__h3ContinuumModeSetup;
     setExistingWidgetValue(
         findWidget(node, TAKE_GROUP_WIDGET),
         Number(selected.group.physical_group),
@@ -1914,7 +1794,7 @@ function selectTakeAction(node, action) {
         findWidget(node, TAKE_REVISION_WIDGET),
         String(selected.revision_id),
     );
-    setExistingWidgetValue(findWidget(node, REGENERATE_WIDGET), "Auto");
+    setRegenerateProgrammatically(node, "Auto");
     setExistingWidgetValue(findWidget(node, RUN_STORAGE_WIDGET), "Save + Auto Resume");
     setExistingWidgetValue(findWidget(node, GENERATION_MODE_WIDGET), GENERATION_MODE_REVIEW);
     setReviewSeedControlFixed(node);
@@ -1930,97 +1810,336 @@ function clearTakeSelection(node) {
     setExistingWidgetValue(findWidget(node, TAKE_ACTION_WIDGET), TAKE_ACTION_AUTOMATIC);
 }
 
-async function loadTakeHistory(node) {
+async function loadTakeHistory(node, options = {}) {
     const runName = takeRunName(node);
-    const requestedSettings = node.__h3ContinuumReadReviewSettings?.();
-    if (!runName || typeof globalThis.fetch !== "function") {
+    const requestedSettings = options.reviewedSettings ?? node.__h3ContinuumReadReviewSettings?.();
+    const identityChanged = node.__h3ContinuumHistoryRun !== runName;
+    if (identityChanged) {
+        node.__h3ContinuumHistoryRun = runName;
         node.__h3ContinuumTakeProject = null;
-        delete node.__h3ContinuumTakeError;
+        delete node.__h3ContinuumBrowseRevision;
+        delete node.__h3ContinuumOutputFailure;
+        delete node.__h3ContinuumQueueNotice;
+        delete node.__h3ContinuumReviewedSettings;
+        delete node.__h3ContinuumReviewedSettingsKey;
         clearTakeSelection(node);
-        node.__h3ContinuumProductionUxRefresh?.();
-        return false;
+    }
+    if (!options.force && node.__h3ContinuumHistoryRequest?.runName === runName) {
+        return node.__h3ContinuumHistoryRequest.promise;
     }
     const token = Number(node.__h3ContinuumTakeLoadToken || 0) + 1;
     node.__h3ContinuumTakeLoadToken = token;
-    try {
-        const subfolder = `h3_continuum/runs/${runName}`;
-        const response = await globalThis.fetch(
-            `/view?filename=project.json&type=output&subfolder=${encodeURIComponent(subfolder)}`,
-            { cache: "no-store" },
-        );
-        if (node.__h3ContinuumTakeLoadToken !== token) return false;
-        if (response.status === 404) {
-            node.__h3ContinuumTakeProject = null;
-            delete node.__h3ContinuumTakeError;
-            clearTakeSelection(node);
-            node.__h3ContinuumProductionUxRefresh?.();
-            return true;
-        }
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const project = await response.json();
-        if (node.__h3ContinuumTakeLoadToken !== token) return false;
-        const legacyV2 = (
-            Number(project?.run_storage_schema_version) === 2
-            && Number(project?.branch_provenance_version) !== 1
-        );
-        if (!legacyV2 && Number(project?.branch_provenance_version) !== 1) {
-            throw new Error("Branch Provenance v1 is unavailable");
-        }
-        node.__h3ContinuumTakeProject = project;
-        node.__h3ContinuumRememberReviewSettings?.(requestedSettings);
-        delete node.__h3ContinuumTakeError;
-        if (legacyV2) {
-            clearTakeSelection(node);
-            node.__h3ContinuumProductionUxRefresh?.();
-            return true;
-        }
-        const selected = selectedTake(node);
-        const selectedId = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
-        const selectedGroup = Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
-        if (
-            selected
-            && (
-                selected.revision_id !== selectedId
-                || selected.group.physical_group !== selectedGroup
-            )
-        ) {
-            setExistingWidgetValue(
-                findWidget(node, TAKE_ACTION_WIDGET),
-                TAKE_ACTION_AUTOMATIC,
-            );
-            setExistingWidgetValue(
-                findWidget(node, TAKE_GROUP_WIDGET),
-                Number(selected.group.physical_group),
-            );
-            setExistingWidgetValue(
-                findWidget(node, TAKE_REVISION_WIDGET),
-                String(selected.revision_id),
-            );
-        }
-        node.__h3ContinuumProductionUxRefresh?.();
-        return true;
-    } catch (error) {
-        if (node.__h3ContinuumTakeLoadToken !== token) return false;
+    const current = () => node.__h3ContinuumTakeLoadToken === token && takeRunName(node) === runName;
+    if (!runName) {
         node.__h3ContinuumTakeProject = null;
-        node.__h3ContinuumTakeError = String(error?.message || error);
-        clearTakeSelection(node);
+        delete node.__h3ContinuumTakeError;
         node.__h3ContinuumProductionUxRefresh?.();
         return false;
     }
+    const promise = (async () => {
+        try {
+            const subfolder = `h3_continuum/runs/${runName}`;
+            const response = await api.fetchApi(
+                `/view?filename=project.json&type=output&subfolder=${encodeURIComponent(subfolder)}`,
+                { cache: "no-store" },
+            );
+            if (!current()) return false;
+            if (response.status === 404) {
+                node.__h3ContinuumTakeProject = null;
+                delete node.__h3ContinuumTakeError;
+                return true;
+            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const project = await response.json();
+            if (!current()) return false;
+            if (project?.run_name && project.run_name !== runName) {
+                throw new Error("Run Storage identity does not match this request");
+            }
+            const legacy = Number(project?.run_storage_schema_version) === 2
+                && Number(project?.branch_provenance_version) !== 1;
+            if (!legacy && Number(project?.branch_provenance_version) !== 1) {
+                throw new Error("Branch Provenance v1 is unavailable");
+            }
+            node.__h3ContinuumTakeProject = project;
+            node.__h3ContinuumRememberReviewSettings?.(requestedSettings);
+            repairStaleReviewRegenerate(node, project);
+            delete node.__h3ContinuumTakeError;
+            return true;
+        } catch (error) {
+            if (!current()) return false;
+            node.__h3ContinuumTakeProject = null;
+            node.__h3ContinuumTakeError = String(error?.message || error);
+            return false;
+        } finally {
+            if (current()) node.__h3ContinuumProductionUxRefresh?.();
+        }
+    })();
+    node.__h3ContinuumHistoryRequest = { runName, token, promise };
+    try { return await promise; }
+    finally {
+        if (node.__h3ContinuumHistoryRequest?.token === token) delete node.__h3ContinuumHistoryRequest;
+    }
 }
 
-function refreshV38TakeHistoryAfterExecution(event) {
-    for (const node of app.graph?._nodes || []) {
-        if (node.comfyClass !== V38_NODE_CLASS) continue;
-        if (event?.type !== "execution_success") delete node.__h3ContinuumQueuedSettings;
-        // Terminal events only trigger authoritative Run Storage readback.
-        // Keep the existing 250 ms retry and release setup only after readback
-        // has had a chance to publish a newer review_ready/complete revision.
-        void loadTakeHistory(node);
-        setTimeout(() => finishModeSetupAfterExecution(node), 0);
-        setTimeout(() => void loadTakeHistory(node), 250);
-        setTimeout(() => finishModeSetupAfterExecution(node), 500);
+// One immutable record per accepted prompt/node/run. Never correlate via
+// Sampler `executed`: that event exists only for nodes returning UI output.
+const reviewPrompts = new Map();
+const reviewEarlyTerminals = new Map();
+let reviewSubmissionCount = 0;
+let reviewQueueSequence = 0;
+
+function reviewRevisionKey(project) {
+    const r = canonicalStorageRevision(project);
+    return r ? JSON.stringify([r.revision_id, r.status, r.review_unit, r.updated_utc]) : "";
+}
+
+function reviewPromptRunName(inputs) {
+    const explicit = String(inputs?.run_name || "").trim();
+    if (explicit) return explicit;
+    const id = String(inputs?.project_id || "").trim().toLowerCase();
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)
+        ? `run_${id.replaceAll("-", "")}` : "";
+}
+
+function reviewPromptIncludes(output, nodeId, options) {
+    const targets = options?.partialExecutionTargets;
+    if (!Array.isArray(targets) || !targets.length) return true;
+    const seen = new Set();
+    const visit = (id) => {
+        id = String(id);
+        if (seen.has(id)) return;
+        seen.add(id);
+        for (const value of Object.values(output[id]?.inputs || {})) {
+            if (Array.isArray(value) && value.length === 2 && output[String(value[0])]) visit(value[0]);
+        }
+    };
+    targets.forEach(visit);
+    return seen.has(String(nodeId));
+}
+
+function activeReviewPrompt(node) {
+    for (const records of reviewPrompts.values()) {
+        const item = !records.terminalEvent && records.find(r => r.node === node && r.runName === takeRunName(node));
+        if (item) return item;
     }
+    return null;
+}
+
+async function refreshV38TakeHistoryAfterExecution(event) {
+    const promptId = String(event?.detail?.prompt_id || "");
+    if (!promptId) return;
+    const records = reviewPrompts.get(promptId);
+    if (!records) {
+        // A very fast execution may finish before the HTTP response. Buffer only
+        // while a submission is in flight; unrelated prompts never affect nodes.
+        if (reviewSubmissionCount && reviewEarlyTerminals.size < 64) {
+            reviewEarlyTerminals.set(promptId, event);
+        }
+        return;
+    }
+    records.terminalEvent = event;
+    if (records.processing) return records.processing;
+    records.processing = (async () => {
+    const pending = [];
+    for (const record of records) {
+        const node = record.node;
+        if (takeRunName(node) !== record.runName || String(node.id) !== record.nodeId
+                || !(app.graph?._nodes || []).includes(node)
+                || record.sequence < Number(node.__h3ContinuumAppliedPromptSequence || 0)) continue;
+        const ok = await loadTakeHistory(node, {force: true, reviewedSettings: record.settings});
+        if (!ok) {
+            if (takeRunName(node) === record.runName) pending.push(record);
+            continue;
+        }
+        if (takeRunName(node) !== record.runName
+                || record.sequence < Number(node.__h3ContinuumAppliedPromptSequence || 0)) continue;
+        const project = node.__h3ContinuumTakeProject;
+        const revision = canonicalStorageRevision(project);
+        // Converted input widgets can submit a graph link rather than a literal
+        // count. In that case the backend, not the browser, resolves its value.
+        const requestedCount = !Array.isArray(record.intent.chunks)
+            ? Number(record.intent.chunks) : NaN;
+        const literalCount = Number.isInteger(requestedCount) && requestedCount > 0;
+        const saved = revision && ["complete", "review_ready"].includes(revision.status)
+            && (revision.status === "complete" || reviewHasUnit(node))
+            && (!revision.review_unit || (reviewHasUnit(node)
+                && (!literalCount || Number(revision.review_unit.end) <= requestedCount)));
+        const changed = reviewRevisionKey(project) !== record.baseline;
+        const success = event.type === "execution_success";
+        const unchangedReview = success && !changed && revision?.status === "review_ready"
+            && record.intent[GENERATION_MODE_WIDGET] === GENERATION_MODE_REVIEW
+            && record.intent[TAKE_ACTION_WIDGET] !== TAKE_ACTION_USE;
+        if (unchangedReview) {
+            node.__h3ContinuumQueueNotice = "No new saved chunk was found for this Queue. Reload progress before continuing.";
+        } else if (saved && (success || changed)) {
+            delete node.__h3ContinuumQueueNotice;
+            if (record.intent[REGENERATE_WIDGET] === "Auto" || record.intent[REGENERATE_WIDGET] === 0) {
+                setRegenerateProgrammatically(node, "Auto");
+                setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
+            }
+            // Only this setup selection can be released. A later mode selection
+            // or an edit to another Run is not owned by this execution.
+            if (record.setup === node.__h3ContinuumModeSetup) delete node.__h3ContinuumModeSetup;
+            node.__h3ContinuumReviewedSettings = record.settings;
+            node.__h3ContinuumAppliedPromptSequence = record.sequence;
+            if (success) delete node.__h3ContinuumOutputFailure;
+            else node.__h3ContinuumOutputFailure = {
+                promptId, runName: record.runName,
+                revisionId: revision.revision_id,
+                message: "Chunk saved; preview/output did not finish. Retry saved output without sampling a new Take.",
+            };
+        }
+        node.__h3ContinuumIntuitiveUxRefresh?.();
+        node.__h3ContinuumProductionUxRefresh?.();
+    }
+    if (reviewPrompts.get(promptId) === records) {
+        if (pending.length) {
+            pending.terminalEvent = event;
+            reviewPrompts.set(promptId, pending);
+        } else reviewPrompts.delete(promptId);
+    }
+    })();
+    try { return await records.processing; } finally { delete records.processing; }
+}
+
+function installReviewQueueAdapter() {
+    if (api.__h3ContinuumReviewQueueAdapter || typeof api.queuePrompt !== "function") return;
+    const previous = api.queuePrompt;
+    api.queuePrompt = async function(number, data, options, ...rest) {
+        const output = { ...(data?.output || {}) };
+        const records = [];
+        for (const [nodeId, item] of Object.entries(output)) {
+            if (item?.class_type !== V38_NODE_CLASS || !reviewPromptIncludes(output, nodeId, options)) continue;
+            const node = app.graph?.getNodeById?.(nodeId)
+                || app.graph?._nodes?.find(n => String(n.id) === nodeId);
+            if (!node || node.comfyClass !== V38_NODE_CLASS) continue;
+            requireFixedSeedForReview(node);
+            const normalizedInputs = { ...(item.inputs || {}) };
+            normalizeRunStorageState(node, normalizedInputs);
+            const inputs = buildReviewQueueInputs(node, normalizedInputs);
+            output[nodeId] = { ...item, inputs };
+            records.push({ node, nodeId, runName: reviewPromptRunName(inputs),
+                settings: reviewSettingsSnapshot(node), setup: node.__h3ContinuumModeSetup,
+                baseline: reviewRevisionKey(node.__h3ContinuumTakeProject),
+                intent: Object.freeze({ ...inputs }), sequence: ++reviewQueueSequence });
+        }
+        if (!records.length) return previous.call(this, number, data, options, ...rest);
+        reviewSubmissionCount++;
+        try {
+            const response = await previous.call(this, number, {...data, output}, options, ...rest);
+            const promptId = String(response?.prompt_id || "");
+            if (!promptId) return response;
+            reviewPrompts.set(promptId, records);
+            for (const r of records) {
+                delete r.node.__h3ContinuumQueueNotice;
+                // Capture is per-prompt, never one mutable "last queue" slot.
+                r.node[REVIEW_PENDING_ACTION] = r.intent[REVIEW_ACTION_WIDGET];
+                r.node[TAKE_PENDING_ACTION] = r.intent[TAKE_ACTION_WIDGET];
+                if (r.node.__h3ContinuumRestartSelected && r.intent[REGENERATE_WIDGET] === "Chunk 1") {
+                    r.node.__h3ContinuumRestartQueued = true;
+                }
+                r.node.__h3ContinuumProductionUxRefresh?.();
+            }
+            const early = reviewEarlyTerminals.get(promptId);
+            reviewEarlyTerminals.delete(promptId);
+            if (early) await refreshV38TakeHistoryAfterExecution(early);
+            return response;
+        } finally {
+            reviewSubmissionCount--;
+            if (!reviewSubmissionCount) reviewEarlyTerminals.clear();
+        }
+    };
+    api.__h3ContinuumReviewQueueAdapter = true;
+}
+
+let reviewSyncPromise = null;
+
+async function synchronizeReviewQueue({discover = false} = {}) {
+    if (reviewSyncPromise) return reviewSyncPromise;
+    reviewSyncPromise = (async () => {
+        let queue;
+        try {
+            const response = await api.fetchApi("/queue", {cache: "no-store"});
+            if (!response.ok) return;
+            queue = await response.json();
+        } catch { return; } // A connection error is not cancellation or completion.
+        const queued = [...(queue.queue_running || []), ...(queue.queue_pending || [])];
+        const present = new Set(queued.map(item => String(item[1])));
+        if (discover) {
+            for (const item of queued) {
+                const promptId = String(item[1] || "");
+                const output = item[2] || {};
+                if (!promptId || reviewPrompts.has(promptId)) continue;
+                const records = [];
+                for (const node of app.graph?._nodes || []) {
+                    const nodeId = String(node.id);
+                    const submitted = output[nodeId];
+                    if (node.comfyClass !== V38_NODE_CLASS || submitted?.class_type !== V38_NODE_CLASS
+                            || !reviewPromptIncludes(output, nodeId, {partialExecutionTargets: item[4]})
+                            || reviewPromptRunName(submitted.inputs) !== takeRunName(node)) continue;
+                    records.push({node, nodeId, runName: takeRunName(node),
+                        settings: reviewSettingsSnapshot(node), setup: node.__h3ContinuumModeSetup,
+                        baseline: reviewRevisionKey(node.__h3ContinuumTakeProject),
+                        intent: Object.freeze({...submitted.inputs}), sequence: ++reviewQueueSequence});
+                }
+                if (records.length) reviewPrompts.set(promptId, records);
+            }
+        }
+        for (const [promptId, records] of [...reviewPrompts]) {
+            if (records.terminalEvent) {
+                await refreshV38TakeHistoryAfterExecution(records.terminalEvent);
+                continue;
+            }
+            if (present.has(promptId)) continue;
+            try {
+                const response = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`, {cache:"no-store"});
+                if (!response.ok) continue;
+                const history = (await response.json())?.[promptId];
+                if (history) {
+                    const messages = history.status?.messages || [];
+                    const terminal = [...messages].reverse().find(item => [
+                        "execution_success", "execution_error", "execution_interrupted",
+                    ].includes(item[0]));
+                    if (terminal) await refreshV38TakeHistoryAfterExecution({type:terminal[0], detail:{prompt_id:promptId}});
+                } else if (!reviewSubmissionCount) {
+                    // No running/pending entry and no history: cancelled before
+                    // execution. No invented commit and no automatic resampling.
+                    reviewPrompts.delete(promptId);
+                    for (const record of records) {
+                        if (takeRunName(record.node) !== record.runName) continue;
+                        record.node.__h3ContinuumQueueNotice = "Queued prompt is no longer pending. Refresh saved progress before continuing.";
+                        record.node.__h3ContinuumIntuitiveUxRefresh?.();
+                        record.node.__h3ContinuumProductionUxRefresh?.();
+                    }
+                }
+            } catch { /* Keep ownership until the server can be read again. */ }
+        }
+    })();
+    try { return await reviewSyncPromise; } finally { reviewSyncPromise = null; }
+}
+
+async function reloadReviewHistory() {
+    for (const node of app.graph?._nodes || []) {
+        if (node.comfyClass === V38_NODE_CLASS) await loadTakeHistory(node, {force: true});
+    }
+    await synchronizeReviewQueue({discover: true});
+}
+
+function reconcileReviewQueueStatus(event) {
+    const remaining = event?.detail?.exec_info?.queue_remaining;
+    if (remaining === 0 && reviewPrompts.size && !reviewSubmissionCount) {
+        // Read the server queue/history rather than inferring completion from
+        // a zero queue count. This also handles dropped terminal messages.
+        return synchronizeReviewQueue();
+    }
+}
+
+function retrySavedReviewOutput(node) {
+    const project = node.__h3ContinuumTakeProject;
+    const head = takeCatalog(node).find(r => r.revision_id === project?.canonical_head_revision_id);
+    if (!head || reviewSettingsChanged(node) || activeReviewPrompt(node)) return;
+    node.__h3ContinuumBrowseRevision = head.revision_id;
+    selectTakeAction(node, TAKE_ACTION_USE);
 }
 
 function attachTakeHistoryReload(node) {
@@ -2090,6 +2209,9 @@ function configureProductionReviewUx(node) {
                 ));
             }
         }
+        const retryOutput = addTransientProductionWidget(node, "button", PRODUCTION_OUTPUT_RETRY_WIDGET,
+            null, () => retrySavedReviewOutput(node));
+        setWidgetTooltip(retryOutput, "Reuse the saved canonical Take and retry decoding/saving. No new Sampling. Then press Queue.");
         const backToSettings = addTransientProductionWidget(
             node,
             "button",
@@ -2114,7 +2236,6 @@ function configureProductionReviewUx(node) {
             null,
             () => {
                 delete node.__h3ContinuumModeSetup;
-                delete node.__h3ContinuumModeSetupQueued;
                 node.__h3ContinuumReviewSettingsOpen = false;
                 node.__h3ContinuumIntuitiveUxRefresh?.();
                 node.__h3ContinuumProductionUxRefresh?.();
@@ -2216,15 +2337,7 @@ function configureProductionReviewUx(node) {
             }
         }
         installProductionSerializationGuard(node);
-        if (!node.__h3ContinuumTakeExecutedRefresh) {
-            const previous = node.onExecuted;
-            node.onExecuted = function(...args) {
-                const result = previous?.apply(this, args);
-                void loadTakeHistory(this).then(() => finishModeSetupAfterExecution(this));
-                return result;
-            };
-            node.__h3ContinuumTakeExecutedRefresh = true;
-        }
+
     }
     const refresh = () => {
         const reviewing = (
@@ -2250,7 +2363,9 @@ function configureProductionReviewUx(node) {
         const reviewOpen = ready && !modeSetup && !settingsOpen;
         const from = findWidget(node, REGENERATE_WIDGET)?.value;
         const edited = reviewSettingsChanged(node);
-        const canReview = !edited && (!from || from === "Auto" || from === 0);
+        const outputFailure = node.__h3ContinuumOutputFailure?.runName === takeRunName(node);
+        const busy = Boolean(activeReviewPrompt(node));
+        const canReview = !edited && !busy && !outputFailure && (!from || from === "Auto" || from === 0);
         const takeCount = takeCatalog(node).length;
         const actionNames = new Set([
             PRODUCTION_STATUS_WIDGET,
@@ -2269,6 +2384,9 @@ function configureProductionReviewUx(node) {
             if (widget[FACADE_TRANSIENT_WIDGET]) continue;
             if (widget.name === PRODUCTION_STATUS_WIDGET) {
                 setWidgetVisible(widget, reviewOpen);
+            } else if (widget.name === PRODUCTION_OUTPUT_RETRY_WIDGET) {
+                setWidgetVisible(widget, reviewOpen && outputFailure);
+                widget.disabled = edited || busy;
             } else if (widget.name === PRODUCTION_REGENERATE_WIDGET) {
                 setWidgetVisible(widget, reviewOpen && canReview && reviewHasUnit(node));
             } else if (
@@ -2283,7 +2401,7 @@ function configureProductionReviewUx(node) {
             } else if (widget.name === PRODUCTION_RETURN_TO_REVIEW_WIDGET) {
                 setWidgetVisible(widget, settingsOpen || (ready && modeSetup));
             } else if (widget.name === PRODUCTION_RESTART_WIDGET) {
-                setWidgetVisible(widget, ready && !modeSetup);
+                setWidgetVisible(widget, ready && !busy);
             } else if (widget.name === TAKE_TOGGLE_WIDGET) {
                 setWidgetVisible(widget, reviewOpen && takeCount > 0);
             } else if (historyNames.has(widget.name)) {
@@ -2307,7 +2425,7 @@ function configureProductionReviewUx(node) {
         }
         const catalog = takeCatalog(node);
         const hasSelection = Boolean(selectedTake(node));
-        const takeActionAvailable = hasSelection && !edited;
+        const takeActionAvailable = hasSelection && !edited && !busy;
         const historyToggle = transientProductionWidgets(node).find(
             (widget) => widget.name === TAKE_TOGGLE_WIDGET,
         );
@@ -2350,6 +2468,7 @@ function configureProductionReviewUx(node) {
                 node,
                 [
                     PRODUCTION_STATUS_WIDGET,
+                    PRODUCTION_OUTPUT_RETRY_WIDGET,
                     PRODUCTION_CONTINUE_WIDGET,
                     PRODUCTION_REGENERATE_WIDGET,
                     PRODUCTION_FINISH_WIDGET,
@@ -2387,18 +2506,33 @@ function configureProductionReviewUx(node) {
             );
             moveNamedWidgetsToFront(node, settingsOrder);
         } else if (Array.isArray(node.__h3ContinuumFacadeOrder)) {
-            moveFacadeWidgetsToFront(node, node.__h3ContinuumFacadeOrder);
+            if (ready && modeSetup) {
+                const order = [...node.__h3ContinuumFacadeOrder];
+                const at = order.indexOf(FACADE_READY_WIDGET);
+                order.splice(at < 0 ? order.length : at + 1, 0,
+                    PRODUCTION_RETURN_TO_REVIEW_WIDGET, PRODUCTION_RESTART_WIDGET);
+                moveNamedWidgetsToFront(node, order);
+            } else moveFacadeWidgetsToFront(node, node.__h3ContinuumFacadeOrder);
         }
         node.setDirtyCanvas?.(true, true);
     };
     node.__h3ContinuumProductionUxRefresh = refresh;
+    if (!node.__h3ContinuumReviewRemovalGuard) {
+        const previous = node.onRemoved;
+        node.onRemoved = function(...args) {
+            this.__h3ContinuumTakeLoadToken = Number(this.__h3ContinuumTakeLoadToken || 0) + 1;
+            for (const [id, records] of reviewPrompts) {
+                const remaining = records.filter(record => record.node !== this);
+                if (remaining.length) reviewPrompts.set(id, remaining);
+                else reviewPrompts.delete(id);
+            }
+            return previous?.apply(this, args);
+        };
+        node.__h3ContinuumReviewRemovalGuard = true;
+    }
     node.__h3ContinuumReviewSettingsChanged = () => reviewSettingsChanged(node);
     node.__h3ContinuumRememberReviewSettings = (requested) => rememberReviewSettings(node, requested);
     node.__h3ContinuumReadReviewSettings = () => reviewSettingsSnapshot(node);
-    node.__h3ContinuumCaptureReviewSettings = () => {
-        node.__h3ContinuumQueuedSettings = reviewSettingsSnapshot(node);
-        node.__h3ContinuumQueuedSettingsRun = takeRunName(node);
-    };
     // Upstream prompt/media edits also invalidate review, not just local widgets.
     if (!node.__h3ContinuumReviewDrawWatch) {
         const previous = node.onDrawForeground;
@@ -2468,9 +2602,11 @@ function configureV38ViewProperty(node) {
 function normalizeRunStorageState(node, apiInputs = null) {
     const storageWidget = findWidget(node, RUN_STORAGE_WIDGET);
     const storageEnabled = storageWidget?.value === "Save + Auto Resume";
-    if (storageEnabled) return true;
-    setRegenerateProgrammatically(node, "Auto");
+    if (storageEnabled) {
+        return true;
+    }
     const nonceWidget = findWidget(node, REROLL_NONCE_WIDGET);
+    setRegenerateProgrammatically(node, "Auto");
     if (nonceWidget) nonceWidget.value = 0;
     if (apiInputs) {
         apiInputs[REGENERATE_WIDGET] = "Auto";
@@ -2504,9 +2640,6 @@ function configureConditionalWidgets(node) {
         const storageEnabled = node.comfyClass === V38_NODE_CLASS
             ? storageWidget?.value === "Save + Auto Resume"
             : normalizeRunStorageState(node);
-        if (node.comfyClass === V38_NODE_CLASS && !storageEnabled) {
-            normalizeRunStorageState(node);
-        }
         const explicitRegeneration = storageEnabled
             && regenerateWidget?.value !== "Auto"
             && Number.parseInt(String(regenerateWidget?.value).replace(/^Chunk\s+/, ""), 10) > 0;
@@ -2734,59 +2867,51 @@ function resetTakeActionAfterQueued(node) {
     return true;
 }
 
+function buildReviewQueueInputs(node, apiInputs) {
+    const result = { ...apiInputs };
+    const value = (name, fallback) => result[name] ?? findWidget(node, name)?.value ?? fallback;
+    const mode = value(GENERATION_MODE_WIDGET, GENERATION_MODE_FULL_RUN);
+    const storage = value(RUN_STORAGE_WIDGET, "Off");
+    const setup = Boolean(node.__h3ContinuumModeSetup);
+    const stale = reviewSettingsChanged(node);
+    let from = value(REGENERATE_WIDGET, "Auto");
+    let nonce = value(REROLL_NONCE_WIDGET, 0);
+
+    // A Run mode change is never a hidden restart. Repair only an unowned
+    // stale Chunk 1 boundary; explicit Advanced regeneration stays explicit.
+    if (
+        setup
+        && from === "Chunk 1"
+        && !node.__h3ContinuumManualRegenerateIntent
+        && !node.__h3ContinuumRestartSelected
+    ) {
+        from = "Auto";
+        nonce = 0;
+    }
+    // Backend rejects regeneration without Run Storage. Normalize the impossible
+    // combination before submission and keep the visible controls consistent.
+    if (storage !== "Save + Auto Resume") {
+        from = "Auto";
+        nonce = 0;
+        setRegenerateProgrammatically(node, "Auto");
+        setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
+    }
+    result[REGENERATE_WIDGET] = from;
+    result[REROLL_NONCE_WIDGET] = nonce;
+    const manual = from && from !== "Auto" && from !== 0;
+    result[GENERATION_MODE_WIDGET] = mode;
+    result[REVIEW_ACTION_WIDGET] = mode === GENERATION_MODE_FULL_RUN || manual || setup || stale
+        ? REVIEW_ACTION_CONTINUE : value(REVIEW_ACTION_WIDGET, REVIEW_ACTION_CONTINUE);
+    for (const [name, fallback] of [[TAKE_GROUP_WIDGET, 0], [TAKE_REVISION_WIDGET, ""],
+        [TAKE_ACTION_WIDGET, TAKE_ACTION_AUTOMATIC]]) {
+        result[name] = setup || stale ? fallback : value(name, fallback);
+    }
+    return result;
+}
+
 function prepareReviewQueueIntent(node, apiInputs) {
     if (node.comfyClass !== V38_NODE_CLASS || !apiInputs) return false;
-    const generationWidget = findWidget(node, GENERATION_MODE_WIDGET);
-    const actionWidget = findWidget(node, REVIEW_ACTION_WIDGET);
-    if (!generationWidget || !actionWidget) return false;
-    const generationMode = generationWidget.value;
-    const modeSetup = Boolean(node.__h3ContinuumModeSetup);
-    const staleReview = node.__h3ContinuumReviewSettingsChanged?.() || false;
-    const storageEnabled = findWidget(node, RUN_STORAGE_WIDGET)?.value === "Save + Auto Resume";
-    const hadFrom = Object.prototype.hasOwnProperty.call(apiInputs, REGENERATE_WIDGET);
-    const hadNonce = Object.prototype.hasOwnProperty.call(apiInputs, "reroll_nonce");
-    let from = hadFrom ? apiInputs[REGENERATE_WIDGET] : findWidget(node, REGENERATE_WIDGET)?.value ?? "Auto";
-    let nonce = hadNonce ? apiInputs.reroll_nonce : findWidget(node, "reroll_nonce")?.value ?? 0;
-    if (modeSetup && from === "Chunk 1" && !node.__h3ContinuumManualRegenerateIntent && !node.__h3ContinuumRestartSelected) {
-        from = "Auto"; nonce = 0;
-        setRegenerateProgrammatically(node, "Auto");
-        setExistingWidgetValue(findWidget(node, "reroll_nonce"), 0);
-    }
-    if (!storageEnabled) {
-        from = "Auto"; nonce = 0;
-        setRegenerateProgrammatically(node, "Auto");
-        setExistingWidgetValue(findWidget(node, "reroll_nonce"), 0);
-    }
-    if (hadFrom || modeSetup || !storageEnabled) apiInputs[REGENERATE_WIDGET] = from;
-    if (hadNonce || modeSetup || !storageEnabled) apiInputs.reroll_nonce = nonce;
-    const manualRegenerate = from && from !== "Auto" && from !== 0;
-    const selectedAction = actionWidget.value;
-    const submittedAction = generationMode === GENERATION_MODE_FULL_RUN || staleReview || manualRegenerate || modeSetup
-        ? REVIEW_ACTION_CONTINUE : selectedAction;
-    apiInputs[GENERATION_MODE_WIDGET] = generationMode;
-    apiInputs[REVIEW_ACTION_WIDGET] = submittedAction;
-    if (staleReview || manualRegenerate || modeSetup) {
-        actionWidget.value = REVIEW_ACTION_CONTINUE;
-        delete node[REVIEW_UI_SELECTION];
-    }
-    const takeDefaults = modeSetup || staleReview;
-    const takeAction = takeDefaults ? TAKE_ACTION_AUTOMATIC : findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
-    apiInputs[TAKE_GROUP_WIDGET] = takeDefaults ? 0 : Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
-    apiInputs[TAKE_REVISION_WIDGET] = takeDefaults ? "" : String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
-    apiInputs[TAKE_ACTION_WIDGET] = takeAction;
-    if (generationMode === GENERATION_MODE_REVIEW && modeSetup) {
-        const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
-        node.__h3ContinuumModeSetupQueued = {setup: node.__h3ContinuumModeSetup, runName: takeRunName(node), baselineRevision: String(revision?.revision_id || "")};
-    } else {
-        delete node.__h3ContinuumModeSetupQueued;
-    }
-    node.__h3ContinuumCaptureReviewSettings?.();
-    if (node.__h3ContinuumRestartSelected && from === "Chunk 1") node.__h3ContinuumRestartQueued = true;
-    else { delete node.__h3ContinuumRestartSelected; delete node.__h3ContinuumRestartQueued; }
-    if (generationMode === GENERATION_MODE_REVIEW && isOneShotReviewAction(submittedAction)) node[REVIEW_PENDING_ACTION] = submittedAction;
-    else delete node[REVIEW_PENDING_ACTION];
-    if (takeAction === TAKE_ACTION_USE || takeAction === TAKE_ACTION_CONTINUE) node[TAKE_PENDING_ACTION] = takeAction;
-    else delete node[TAKE_PENDING_ACTION];
+    Object.assign(apiInputs, buildReviewQueueInputs(node, apiInputs));
     return true;
 }
 
@@ -2841,8 +2966,7 @@ function configureReviewControls(node) {
                 delete node.__h3ContinuumRestartSelected;
                 const from = findWidget(node, REGENERATE_WIDGET);
                 if (from?.value === "Chunk 1") {
-                    from.value = "Auto";
-                    from.callback?.("Auto");
+                    setRegenerateProgrammatically(node, "Auto");
                 }
             }
             return result;
@@ -2916,7 +3040,6 @@ function configureNode(node) {
     configureReviewControls(node);
     configureIntuitiveV38Ux(node);
     configureProductionReviewUx(node);
-    installReviewModeSetupQueueContract(node);
     applyV38View(node);
     node.setDirtyCanvas?.(true, true);
     return projectWidget;
@@ -2933,12 +3056,15 @@ app.registerExtension({
     name: "H3Continuum.ProjectId",
 
     setup() {
+        installReviewQueueAdapter();
+        api.addEventListener("reconnected", reloadReviewHistory);
+        api.addEventListener("status", reconcileReviewQueueStatus);
         for (const eventName of [
             "execution_success",
             "execution_error",
             "execution_interrupted",
         ]) {
-            app.api?.addEventListener?.(
+            api.addEventListener(
                 eventName,
                 refreshV38TakeHistoryAfterExecution,
             );
@@ -3003,12 +3129,6 @@ app.registerExtension({
                     node.__h3ContinuumResolutionUxRefresh?.();
                     requireFixedSeedForReview(node);
                     normalizeRunStorageState(node, apiNode.inputs);
-                    if (
-                        node.comfyClass === V38_NODE_CLASS
-                        && node.__h3ContinuumModeSetup
-                    ) {
-                        await loadTakeHistory(node);
-                    }
                     prepareReviewQueueIntent(node, apiNode.inputs);
                     apiNode.inputs.diagnostics = settingValue(SETTINGS.detailedReport, false)
                         ? "Detailed Report"
