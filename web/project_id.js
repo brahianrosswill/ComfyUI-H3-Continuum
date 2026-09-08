@@ -434,18 +434,17 @@ function installReviewModeSetupQueueContract(node) {
     const generationWidget = findWidget(node, GENERATION_MODE_WIDGET);
     if (!generationWidget) return;
 
-    // ComfyUI frontend 1.49 serializes API inputs through widget.serializeValue.
-    // Keep the visible/saved settings intact while making the first Queue after
-    // Full Run -> Review Each Chunk an explicit, non-destructive Chunk 1 branch.
-    const overrides = new Map([
+    // ComfyUI frontend 1.49 calls widget.beforeQueued before serializeValue.
+    // Mode selection is presentation/setup only: it must never inject a hidden
+    // Chunk 1 restart. History selection is also cleared from a normal mode
+    // setup so Run Storage remains the authority for compatible prefix reuse.
+    const setupOverrides = new Map([
         [REVIEW_ACTION_WIDGET, REVIEW_ACTION_CONTINUE],
-        [REGENERATE_WIDGET, "Chunk 1"],
-        [REROLL_NONCE_WIDGET, 0],
         [TAKE_GROUP_WIDGET, 0],
         [TAKE_REVISION_WIDGET, ""],
         [TAKE_ACTION_WIDGET, TAKE_ACTION_AUTOMATIC],
     ]);
-    for (const [name, value] of overrides) {
+    for (const [name, value] of setupOverrides) {
         const widget = findWidget(node, name);
         if (!widget || widget.__h3ContinuumModeSetupSerializeValue) continue;
         const previous = widget.serializeValue;
@@ -458,14 +457,60 @@ function installReviewModeSetupQueueContract(node) {
         widget.__h3ContinuumModeSetupSerializeValue = true;
     }
 
+    const regenerateWidget = findWidget(node, REGENERATE_WIDGET);
+    if (regenerateWidget && !regenerateWidget.__h3ContinuumSafeSerializeValue) {
+        const previous = regenerateWidget.serializeValue;
+        regenerateWidget.serializeValue = function(...args) {
+            if (findWidget(node, RUN_STORAGE_WIDGET)?.value !== "Save + Auto Resume") {
+                return "Auto";
+            }
+            if (
+                reviewModeSetupActive(node)
+                && this.value === "Chunk 1"
+                && !node.__h3ContinuumManualRegenerateIntent
+                && !node.__h3ContinuumRestartSelected
+            ) {
+                return "Auto";
+            }
+            return typeof previous === "function"
+                ? previous.apply(this, args)
+                : this.value;
+        };
+        regenerateWidget.__h3ContinuumSafeSerializeValue = true;
+    }
+    const nonceWidget = findWidget(node, REROLL_NONCE_WIDGET);
+    if (nonceWidget && !nonceWidget.__h3ContinuumSafeSerializeValue) {
+        const previous = nonceWidget.serializeValue;
+        nonceWidget.serializeValue = function(...args) {
+            if (findWidget(node, RUN_STORAGE_WIDGET)?.value !== "Save + Auto Resume") {
+                return 0;
+            }
+            if (
+                reviewModeSetupActive(node)
+                && regenerateWidget?.value === "Chunk 1"
+                && !node.__h3ContinuumManualRegenerateIntent
+                && !node.__h3ContinuumRestartSelected
+            ) {
+                return 0;
+            }
+            return typeof previous === "function"
+                ? previous.apply(this, args)
+                : this.value;
+        };
+        nonceWidget.__h3ContinuumSafeSerializeValue = true;
+    }
+
     const previousBeforeQueued = generationWidget.beforeQueued;
     generationWidget.beforeQueued = function(...args) {
         const result = previousBeforeQueued?.apply(this, args);
+        normalizeRunStorageState(node);
         if (reviewModeSetupActive(node)) {
+            normalizeUnownedRestart(node);
+            const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
             node.__h3ContinuumModeSetupQueued = {
                 setup: node.__h3ContinuumModeSetup,
                 runName: takeRunName(node),
-                promptId: "",
+                baselineRevision: String(revision?.revision_id || ""),
             };
             node.__h3ContinuumQueuedSettings = reviewSettingsSnapshot(node);
             node.__h3ContinuumQueuedSettingsRun = takeRunName(node);
@@ -498,6 +543,39 @@ function setExistingWidgetValue(widget, value) {
     if (!widget || widget.value === value) return;
     widget.value = value;
     widget.callback?.(value);
+}
+
+function setRegenerateProgrammatically(node, value) {
+    const widget = findWidget(node, REGENERATE_WIDGET);
+    if (!widget || widget.value === value) {
+        if (value === "Auto" || value === 0 || value == null) {
+            delete node.__h3ContinuumManualRegenerateIntent;
+        }
+        return;
+    }
+    node.__h3ContinuumProgrammaticRegenerate = true;
+    try {
+        setExistingWidgetValue(widget, value);
+    } finally {
+        delete node.__h3ContinuumProgrammaticRegenerate;
+    }
+    if (value === "Auto" || value === 0 || value == null) {
+        delete node.__h3ContinuumManualRegenerateIntent;
+    }
+}
+
+function normalizeUnownedRestart(node) {
+    const widget = findWidget(node, REGENERATE_WIDGET);
+    if (
+        widget?.value === "Chunk 1"
+        && !node.__h3ContinuumManualRegenerateIntent
+        && !node.__h3ContinuumRestartSelected
+    ) {
+        setRegenerateProgrammatically(node, "Auto");
+        setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
+        return true;
+    }
+    return false;
 }
 
 function facadeProductionWidgets(node) {
@@ -1096,12 +1174,15 @@ function configureIntuitiveV38Ux(node) {
         onSet: (value, source) => {
             const reviewing = value === FACADE_GENERATE_REVIEW;
             if (reviewing && source.value !== GENERATION_MODE_REVIEW) {
-                // Selecting a mode is setup, not selecting a saved review.
+                // Selecting a mode is setup, not selecting a saved review and
+                // not a request to restart from Chunk 1.
                 node.__h3ContinuumModeSetup = {};
                 delete node.__h3ContinuumModeSetupQueued;
+                normalizeUnownedRestart(node);
             } else if (!reviewing) {
                 delete node.__h3ContinuumModeSetup;
                 delete node.__h3ContinuumModeSetupQueued;
+                normalizeUnownedRestart(node);
             }
             setExistingWidgetValue(
                 source,
@@ -1134,6 +1215,8 @@ function configureIntuitiveV38Ux(node) {
             const enabled = value === FACADE_SAVE_ON;
             setExistingWidgetValue(source, enabled ? "Save + Auto Resume" : "Off");
             if (!enabled) {
+                setRegenerateProgrammatically(node, "Auto");
+                setExistingWidgetValue(findWidget(node, REROLL_NONCE_WIDGET), 0);
                 setExistingWidgetValue(
                     findWidget(node, GENERATION_MODE_WIDGET),
                     GENERATION_MODE_FULL_RUN,
@@ -1436,13 +1519,17 @@ function rememberReviewSettings(node, requestedSettings) {
     delete node.__h3ContinuumQueuedSettingsRun;
 }
 
-function finishModeSetupAfterExecution(node, promptId = "") {
+function finishModeSetupAfterExecution(node) {
     const queued = node.__h3ContinuumModeSetupQueued;
+    const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
+    const revisionId = String(revision?.revision_id || "");
     if (
         !queued
         || queued.setup !== node.__h3ContinuumModeSetup
         || queued.runName !== takeRunName(node)
-        || (promptId && queued.promptId !== promptId)
+        || !revisionId
+        || revisionId === String(queued.baselineRevision || "")
+        || !["review_ready", "complete"].includes(revision?.status)
     ) {
         return false;
     }
@@ -1451,26 +1538,6 @@ function finishModeSetupAfterExecution(node, promptId = "") {
     node.__h3ContinuumIntuitiveUxRefresh?.();
     node.__h3ContinuumProductionUxRefresh?.();
     return true;
-}
-
-function bindModeSetupPromptFromExecutedNode(event) {
-    const detail = event?.detail || event || {};
-    const promptId = String(detail.prompt_id || "");
-    const executedNodeId = String(detail.display_node || detail.node || "");
-    if (!promptId || !executedNodeId) return;
-    for (const node of app.graph?._nodes || []) {
-        const queued = node.__h3ContinuumModeSetupQueued;
-        if (
-            node.comfyClass !== V38_NODE_CLASS
-            || String(node.id) !== executedNodeId
-            || !queued
-            || queued.setup !== node.__h3ContinuumModeSetup
-            || queued.runName !== takeRunName(node)
-        ) {
-            continue;
-        }
-        queued.promptId = promptId;
-    }
 }
 
 function selectProductionRestart(node) {
@@ -1943,15 +2010,16 @@ async function loadTakeHistory(node) {
 }
 
 function refreshV38TakeHistoryAfterExecution(event) {
-    const promptId = String(event?.detail?.prompt_id || "");
     for (const node of app.graph?._nodes || []) {
         if (node.comfyClass !== V38_NODE_CLASS) continue;
-        if (event?.type === "execution_success" && promptId) {
-            finishModeSetupAfterExecution(node, promptId);
-        }
         if (event?.type !== "execution_success") delete node.__h3ContinuumQueuedSettings;
+        // Terminal events only trigger authoritative Run Storage readback.
+        // Keep the existing 250 ms retry and release setup only after readback
+        // has had a chance to publish a newer review_ready/complete revision.
         void loadTakeHistory(node);
+        setTimeout(() => finishModeSetupAfterExecution(node), 0);
         setTimeout(() => void loadTakeHistory(node), 250);
+        setTimeout(() => finishModeSetupAfterExecution(node), 500);
     }
 }
 
@@ -2152,8 +2220,7 @@ function configureProductionReviewUx(node) {
             const previous = node.onExecuted;
             node.onExecuted = function(...args) {
                 const result = previous?.apply(this, args);
-                finishModeSetupAfterExecution(this);
-                void loadTakeHistory(this);
+                void loadTakeHistory(this).then(() => finishModeSetupAfterExecution(this));
                 return result;
             };
             node.__h3ContinuumTakeExecutedRefresh = true;
@@ -2401,12 +2468,9 @@ function configureV38ViewProperty(node) {
 function normalizeRunStorageState(node, apiInputs = null) {
     const storageWidget = findWidget(node, RUN_STORAGE_WIDGET);
     const storageEnabled = storageWidget?.value === "Save + Auto Resume";
-    if (storageEnabled) {
-        return true;
-    }
-    const regenerateWidget = findWidget(node, REGENERATE_WIDGET);
+    if (storageEnabled) return true;
+    setRegenerateProgrammatically(node, "Auto");
     const nonceWidget = findWidget(node, REROLL_NONCE_WIDGET);
-    if (regenerateWidget) regenerateWidget.value = "Auto";
     if (nonceWidget) nonceWidget.value = 0;
     if (apiInputs) {
         apiInputs[REGENERATE_WIDGET] = "Auto";
@@ -2420,11 +2484,29 @@ function configureConditionalWidgets(node) {
     const regenerateWidget = findWidget(node, REGENERATE_WIDGET);
     const nonceWidget = findWidget(node, REROLL_NONCE_WIDGET);
     const runNameWidget = findWidget(node, LEGACY_RUN_NAME_WIDGET);
+    if (regenerateWidget && !regenerateWidget.__h3ContinuumManualIntentCallback) {
+        const previous = regenerateWidget.callback;
+        regenerateWidget.callback = function(value, ...args) {
+            const result = previous?.call(this, value, ...args);
+            if (!node.__h3ContinuumProgrammaticRegenerate) {
+                if (value === "Auto" || value === 0 || value == null) {
+                    delete node.__h3ContinuumManualRegenerateIntent;
+                } else {
+                    node.__h3ContinuumManualRegenerateIntent = true;
+                }
+            }
+            return result;
+        };
+        regenerateWidget.__h3ContinuumManualIntentCallback = true;
+    }
     const refresh = () => {
         const productionView = true;
         const storageEnabled = node.comfyClass === V38_NODE_CLASS
             ? storageWidget?.value === "Save + Auto Resume"
             : normalizeRunStorageState(node);
+        if (node.comfyClass === V38_NODE_CLASS && !storageEnabled) {
+            normalizeRunStorageState(node);
+        }
         const explicitRegeneration = storageEnabled
             && regenerateWidget?.value !== "Auto"
             && Number.parseInt(String(regenerateWidget?.value).replace(/^Chunk\s+/, ""), 10) > 0;
@@ -2653,74 +2735,58 @@ function resetTakeActionAfterQueued(node) {
 }
 
 function prepareReviewQueueIntent(node, apiInputs) {
-    if (node.comfyClass !== V38_NODE_CLASS || !apiInputs) {
-        return false;
-    }
+    if (node.comfyClass !== V38_NODE_CLASS || !apiInputs) return false;
     const generationWidget = findWidget(node, GENERATION_MODE_WIDGET);
     const actionWidget = findWidget(node, REVIEW_ACTION_WIDGET);
-    if (!generationWidget || !actionWidget) {
-        return false;
-    }
+    if (!generationWidget || !actionWidget) return false;
     const generationMode = generationWidget.value;
-    const selectedAction = actionWidget.value;
-    const from = findWidget(node, REGENERATE_WIDGET)?.value;
-    const staleReview = node.__h3ContinuumReviewSettingsChanged?.() || false;
     const modeSetup = Boolean(node.__h3ContinuumModeSetup);
-    const savedStatus = canonicalStorageRevision(node.__h3ContinuumTakeProject)?.status;
-    const savedReview = ["review_ready", "complete"].includes(savedStatus);
+    const staleReview = node.__h3ContinuumReviewSettingsChanged?.() || false;
+    const storageEnabled = findWidget(node, RUN_STORAGE_WIDGET)?.value === "Save + Auto Resume";
+    const hadFrom = Object.prototype.hasOwnProperty.call(apiInputs, REGENERATE_WIDGET);
+    const hadNonce = Object.prototype.hasOwnProperty.call(apiInputs, "reroll_nonce");
+    let from = hadFrom ? apiInputs[REGENERATE_WIDGET] : findWidget(node, REGENERATE_WIDGET)?.value ?? "Auto";
+    let nonce = hadNonce ? apiInputs.reroll_nonce : findWidget(node, "reroll_nonce")?.value ?? 0;
+    if (modeSetup && from === "Chunk 1" && !node.__h3ContinuumManualRegenerateIntent && !node.__h3ContinuumRestartSelected) {
+        from = "Auto"; nonce = 0;
+        setRegenerateProgrammatically(node, "Auto");
+        setExistingWidgetValue(findWidget(node, "reroll_nonce"), 0);
+    }
+    if (!storageEnabled) {
+        from = "Auto"; nonce = 0;
+        setRegenerateProgrammatically(node, "Auto");
+        setExistingWidgetValue(findWidget(node, "reroll_nonce"), 0);
+    }
+    if (hadFrom || modeSetup || !storageEnabled) apiInputs[REGENERATE_WIDGET] = from;
+    if (hadNonce || modeSetup || !storageEnabled) apiInputs.reroll_nonce = nonce;
     const manualRegenerate = from && from !== "Auto" && from !== 0;
+    const selectedAction = actionWidget.value;
     const submittedAction = generationMode === GENERATION_MODE_FULL_RUN || staleReview || manualRegenerate || modeSetup
-        ? REVIEW_ACTION_CONTINUE
-        : selectedAction;
+        ? REVIEW_ACTION_CONTINUE : selectedAction;
+    apiInputs[GENERATION_MODE_WIDGET] = generationMode;
+    apiInputs[REVIEW_ACTION_WIDGET] = submittedAction;
     if (staleReview || manualRegenerate || modeSetup) {
         actionWidget.value = REVIEW_ACTION_CONTINUE;
         delete node[REVIEW_UI_SELECTION];
     }
-    apiInputs[GENERATION_MODE_WIDGET] = generationMode;
-    apiInputs[REVIEW_ACTION_WIDGET] = submittedAction;
-    let takeAction = findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
-    apiInputs[TAKE_GROUP_WIDGET] = Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
-    apiInputs[TAKE_REVISION_WIDGET] = String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
+    const takeDefaults = modeSetup || staleReview;
+    const takeAction = takeDefaults ? TAKE_ACTION_AUTOMATIC : findWidget(node, TAKE_ACTION_WIDGET)?.value || TAKE_ACTION_AUTOMATIC;
+    apiInputs[TAKE_GROUP_WIDGET] = takeDefaults ? 0 : Number(findWidget(node, TAKE_GROUP_WIDGET)?.value || 0);
+    apiInputs[TAKE_REVISION_WIDGET] = takeDefaults ? "" : String(findWidget(node, TAKE_REVISION_WIDGET)?.value || "");
     apiInputs[TAKE_ACTION_WIDGET] = takeAction;
     if (generationMode === GENERATION_MODE_REVIEW && modeSetup) {
-        // Saved results are history, not the first result of a newly selected
-        // Review Each Chunk run. Start a non-destructive branch at Chunk 1 in
-        // the queued payload; keep the visible settings unchanged.
-        if (savedReview) {
-            apiInputs[REGENERATE_WIDGET] = "Chunk 1";
-            apiInputs[REROLL_NONCE_WIDGET] = 0;
-            apiInputs[TAKE_GROUP_WIDGET] = 0;
-            apiInputs[TAKE_REVISION_WIDGET] = "";
-            apiInputs[TAKE_ACTION_WIDGET] = TAKE_ACTION_AUTOMATIC;
-            takeAction = TAKE_ACTION_AUTOMATIC;
-        }
-        node.__h3ContinuumModeSetupQueued = {
-            setup: node.__h3ContinuumModeSetup,
-            runName: takeRunName(node),
-        };
+        const revision = canonicalStorageRevision(node.__h3ContinuumTakeProject);
+        node.__h3ContinuumModeSetupQueued = {setup: node.__h3ContinuumModeSetup, runName: takeRunName(node), baselineRevision: String(revision?.revision_id || "")};
     } else {
         delete node.__h3ContinuumModeSetupQueued;
     }
     node.__h3ContinuumCaptureReviewSettings?.();
-    if (node.__h3ContinuumRestartSelected && from === "Chunk 1") {
-        node.__h3ContinuumRestartQueued = true;
-    } else {
-        delete node.__h3ContinuumRestartSelected;
-        delete node.__h3ContinuumRestartQueued;
-    }
-    if (
-        generationMode === GENERATION_MODE_REVIEW
-        && isOneShotReviewAction(submittedAction)
-    ) {
-        node[REVIEW_PENDING_ACTION] = submittedAction;
-    } else {
-        delete node[REVIEW_PENDING_ACTION];
-    }
-    if (takeAction === TAKE_ACTION_USE || takeAction === TAKE_ACTION_CONTINUE) {
-        node[TAKE_PENDING_ACTION] = takeAction;
-    } else {
-        delete node[TAKE_PENDING_ACTION];
-    }
+    if (node.__h3ContinuumRestartSelected && from === "Chunk 1") node.__h3ContinuumRestartQueued = true;
+    else { delete node.__h3ContinuumRestartSelected; delete node.__h3ContinuumRestartQueued; }
+    if (generationMode === GENERATION_MODE_REVIEW && isOneShotReviewAction(submittedAction)) node[REVIEW_PENDING_ACTION] = submittedAction;
+    else delete node[REVIEW_PENDING_ACTION];
+    if (takeAction === TAKE_ACTION_USE || takeAction === TAKE_ACTION_CONTINUE) node[TAKE_PENDING_ACTION] = takeAction;
+    else delete node[TAKE_PENDING_ACTION];
     return true;
 }
 
@@ -2867,10 +2933,6 @@ app.registerExtension({
     name: "H3Continuum.ProjectId",
 
     setup() {
-        app.api?.addEventListener?.(
-            "executed",
-            bindModeSetupPromptFromExecutedNode,
-        );
         for (const eventName of [
             "execution_success",
             "execution_error",

@@ -20,7 +20,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install -r requirements.txt numpy safetensors pytest psutil
+          python -m pip install -r requirements.txt numpy safetensors pytest psutil opencv-python-headless Pillow
       - name: Compile Python
         run: python -m compileall -q .
       - name: Run tests

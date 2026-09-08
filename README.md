@@ -2,7 +2,7 @@
 
 **Download workflow: [JSON](examples/workflows/MiniMax_H3_Continuum_V38.json) | [ZIP](examples/workflows/MiniMax_H3_Continuum_V38.zip)** — [Latest release](https://github.com/ukr8b3g-cmyk/ComfyUI-H3-Continuum/releases/latest)
 
-⚠️ Hotfix in progress: We’re investigating reported issues with chunk continuation and Review Each Chunk mode in V3.8. A hotfix is being prepared. Thank you for your reports and patience—we’ll update this page when it’s ready.
+✅ V3.8 hotfix applied on `main` — September 8, 2026: Review Each Chunk continuation, stale `Regenerate From` state, completed-sequence extension, and Render History queue handling have been repaired. Update with `git pull --ff-only origin main` (or ComfyUI Manager **Update**), restart ComfyUI, and hard-refresh the browser if the old UI remains. Existing saved Takes are preserved. Issue #13 remains a separate open long-continuation quality issue and is not part of this hotfix.
 
 <img width="1536" height="1024" alt="exec-55ad0463-8655-409c-b9a6-49d1315cdd78" src="https://github.com/user-attachments/assets/063bb16b-5c25-44f8-9304-031995502b26" />
 
@@ -463,23 +463,35 @@ If you want a review pause instead, choose `Run = Review Each Chunk` in step 6. 
 
 #### 9. Add more chunks to a completed sequence
 
-For a compatible saved run without a Last Image constraint, increasing the target can reuse completed chunks. This requires saved progress, not just an existing MP4 file.
+**You do not need Render History just to make a completed video longer.** For an ordinary extension, go back to the normal settings, increase the target `Chunks`, and Queue again. `Chunks` is the **final total number of chunks**, not the number you want to add next.
 
-1. Keep the same Sampler/workflow and `Run Name (Optional Override)`. Do not create a new run identity.
-2. Keep `Base Seed` unchanged and `Control After Generate = fixed`.
-3. Keep `Progress = On — Resume and Takes available`, and keep the saved progress files available.
-4. Keep `Seconds per Chunk` and the generation inputs unchanged.
-5. Set `Regenerate From = Auto`.
-6. Change **only the target count** in `Chunks`: for example, change `3` to `5` to add two chunks. Do not set it to `2`.
-7. Choose `Run = Review Each Chunk` for one new review unit per Queue, or `Run = Generate Full Video` to finish all missing chunks.
-8. Check `Total Length`, then click the top-right blue `Run` button and check the reuse report described below.
+For the simplest and safest extension, keep the existing generation conditions unchanged: the same Sampler/workflow and run identity, `Base Seed`, `Control After Generate = fixed`, `Seconds per Chunk`, prompt, model/LoRA, media, dimensions, sampling schedule, Continuity, and Audio Continuity. Keep `Progress = On — Resume and Takes available` and `Regenerate From = Auto`.
 
-With compatible progress for three 5-second chunks, the new target is 25 seconds. Review mode should first produce Chunk 4 and a 20-second output; continuing again completes Chunk 5. Full-video mode should produce Chunks 4–5 and the 25-second output in one Queue.
+**Example: extend a completed 2 × 5-second sequence to 3 × 5 seconds**
 
-**Do not assume append-only reuse with Last Image.** Extending a sequence changes where its final-image constraint belongs. The former last chunk, or a terminal pair, may need regeneration. Likewise, changing the model, prompt, media, dimensions, schedule, or continuation settings can invalidate saved progress. `Progress = On` enables compatibility checking; it does not force incompatible chunks to be reused.
+1. Finish the original two chunks. The completed target is `Chunks = 2`, so the saved video is 10 seconds.
+2. Click `Back to Settings`. You do **not** need to open `Render History`.
+3. Change `Chunks` from `2` to `3`. `Total Length` changes from 10 seconds to 15 seconds.
+4. Keep `Progress = On — Resume and Takes available` and `Regenerate From = Auto`. Keep the prompt and the existing generation inputs unchanged for this ordinary extension.
+5. Use `Run = Review Each Chunk` if you want to review the new chunk, or `Run = Generate Full Video` if you want all currently missing chunks generated in one Queue.
+6. Click the top-right blue `Run` button.
+
+With compatible saved progress, the expected work is:
+
+- Chunk 1 → reused; no new Sampling
+- Chunk 2 → reused; no new Sampling
+- Chunk 3 → newly generated
+- final saved sequence → 3 chunks / 15 seconds
+
+The same rule applies to a larger extension. For example, changing `Chunks` from `3` to `5` means the new target is five total chunks; it does **not** mean “add five.” Review mode first generates Chunk 4, then Chunk 5 on the next accepted continuation. Full-video mode generates the missing Chunks 4–5 in one Queue.
+
+Switching `Generate Full Video` ↔ `Review Each Chunk` by itself does **not** mean restart from Chunk 1. A Chunk 1 restart happens only when you explicitly choose `Start again from Chunk 1`, explicitly set Advanced `Regenerate From = Chunk 1`, or the backend determines that the stored prefix is incompatible with the current generation contract.
+
+`Render History` is for a different job: browsing stored Takes, selecting an older Take, or branching with `Continue From Here`. Normal append-style extension does not require History. `Previous Take` / `Next Take` only browse stored results; they do not generate a new chunk.
+
+**Do not assume append-only reuse with Last Image.** Extending a sequence changes where its final-image constraint belongs. The former last chunk, or a terminal pair, may need regeneration. Likewise, changing the prompt or other generation-contract inputs can invalidate saved progress. `Progress = On` enables compatibility checking; it does not force incompatible chunks to be reused.
 
 The extension path is covered by CPU compatibility tests, including two-to-three chunks and Last Image invalidation. It is not the same GPU test as the two-chunk review timing example below; arbitrary extensions and media combinations have not all been GPU-verified.
-
 #### 10. Understand continuation time and check reuse
 
 Continuing does not mean saving only the new segment. With compatible saved progress, the normal workflow:

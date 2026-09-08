@@ -1096,7 +1096,7 @@ def test_n2c_history_refresh_hooks_and_multiline_surface_are_present():
     source = PROJECT_ID_JS.read_text(encoding="utf-8")
     assert '"Render History / Takes"' in source
     assert '{ multiline: true }' in source
-    assert "void loadTakeHistory(this);" in source
+    assert "loadTakeHistory(this)" in source
     assert "attachTakeHistoryReload(node);" in source
     assert "node.__h3ContinuumTakeInitialLoad" in source
     assert 'const TAKE_TOGGLE_WIDGET = "Render History";' in source

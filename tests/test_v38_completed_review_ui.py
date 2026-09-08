@@ -187,7 +187,7 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
       prepareReviewQueueIntent(setup,inputs);
       assert.equal(inputs.review_action,"Continue / Next");
       if(["complete","review_ready"].includes(oldStatus)){
-        assert.equal(inputs.reroll_from_chunk,"Chunk 1","saved history starts a new review branch");
+        assert.equal(inputs.reroll_from_chunk,"Auto","mode switch preserves compatible continuation");
         assert.equal(inputs.reroll_nonce,0);
         assert.equal(inputs.take_group,0);
         assert.equal(inputs.take_revision_id,"");
@@ -195,7 +195,7 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
       }
       await load(setup,old);
       assert(visible(setup,"Chunks"),"Queue alone does not mean generation completed");
-      project=state("review_ready",{start:1,end:1,physical_group:1},"new-output");
+      project=state("review_ready",{start:2,end:2,physical_group:2},"new-output");
       setup.onExecuted();
       await new Promise(resolve=>setImmediate(resolve));
       assert(buttons.every(name=>visible(setup,name)),"new queued result opens ordinary review");
@@ -234,53 +234,79 @@ async function load(n,p) {project=p;await loadTakeHistory(n);n.__h3ContinuumIntu
   // Frontend 1.49 contract: widget.beforeQueued runs before serializeValue;
   // legacy beforeQueuePrompt is not part of the real queue path.
   const liveContract=makeNode();liveContract.id=312;app.graph._nodes=[liveContract];
+  w(liveContract,"chunks").value=4;
   await load(liveContract,state("complete",{start:3,end:3,physical_group:3},"live-old-complete"));
   w(liveContract,"Run").callback("Generate Full Video");
   w(liveContract,"Run").callback("Review Each Chunk");
   for(const widget of liveContract.widgets)widget.beforeQueued?.({isPartialExecution:false});
   const liveInputs=await serializedInputs(liveContract);
-  assert.equal(liveInputs.reroll_from_chunk,"Chunk 1");
+  assert.equal(liveInputs.reroll_from_chunk,"Auto","mode switch must not inject Chunk 1");
   assert.equal(liveInputs.reroll_nonce,0);
   assert.equal(liveInputs.take_group,0);
   assert.equal(liveInputs.take_revision_id,"");
   assert.equal(liveInputs.take_action,"Automatic");
   assert.equal(liveInputs.review_action,"Continue / Next");
-  assert.equal(w(liveContract,"reroll_from_chunk").value,"Auto","visible settings stay unchanged");
-  project=state("review_ready",{start:1,end:1,physical_group:1},"live-fresh-chunk-1");
-  emit("executed",{node:"312",prompt_id:"live-prompt"});
+  project=state("review_ready",{start:4,end:4,physical_group:4},"live-fresh-chunk-4");
+  // Sampler V3.8 does not need to emit a node-specific `executed` UI event.
   emit("execution_success",{prompt_id:"live-prompt"});
   await new Promise(resolve=>setTimeout(resolve,20));
-  assert(buttons.every(name=>visible(liveContract,name)),"real completion events open Chunk 1 review");
-  assert.match(w(liveContract,"Review Ready").value,/Chunk 1/);
-  // Acceptance lifecycle: 3 x 5 seconds must stop at every review boundary.
-  const flow=makeNode();w(flow,"chunks").value=3;w(flow,"chunk_seconds").value=5;
+  assert(buttons.every(name=>visible(liveContract,name)),"terminal readback opens the new review");
+  assert.match(w(liveContract,"Review Ready").value,/Chunk 4/);
+  // Acceptance lifecycle: extend a completed 3 x 5-second prefix to 5 x 5 seconds.
+  const flow=makeNode();w(flow,"chunks").value=5;w(flow,"chunk_seconds").value=5;
   await load(flow,state("complete",{start:3,end:3,physical_group:3},"old-complete-3x5"));
   w(flow,"Run").callback("Generate Full Video");
   w(flow,"Run").callback("Review Each Chunk");
-  const chunk1Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
-  prepareReviewQueueIntent(flow,chunk1Inputs);
-  assert.equal(chunk1Inputs.reroll_from_chunk,"Chunk 1");
-  project=state("review_ready",{start:1,end:1,physical_group:1},"fresh-chunk-1");
+  const chunk4Inputs={reroll_from_chunk:"Auto",reroll_nonce:0,
+    take_group:9,take_revision_id:"stale",take_action:"Use This Take"};
+  prepareReviewQueueIntent(flow,chunk4Inputs);
+  assert.equal(chunk4Inputs.reroll_from_chunk,"Auto","extension reuses the compatible prefix");
+  assert.equal(chunk4Inputs.take_group,0);
+  assert.equal(chunk4Inputs.take_revision_id,"");
+  assert.equal(chunk4Inputs.take_action,"Automatic");
+  project=state("review_ready",{start:4,end:4,physical_group:4},"fresh-chunk-4");
   flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
-  assert(buttons.every(name=>visible(flow,name)),"Chunk 1 opens the review screen");
-  assert.match(w(flow,"Review Ready").value,/Chunk 1/);
+  assert(buttons.every(name=>visible(flow,name)),"Chunk 4 opens the review screen");
+  assert.match(w(flow,"Review Ready").value,/Chunk 4/);
   w(flow,"Use it and continue").callback();
-  const chunk2Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
-  prepareReviewQueueIntent(flow,chunk2Inputs);
-  assert.equal(chunk2Inputs.reroll_from_chunk,"Auto","continuation does not restart Chunk 1");
-  project=state("review_ready",{start:2,end:2,physical_group:2},"fresh-chunk-2");
+  const chunk5Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
+  prepareReviewQueueIntent(flow,chunk5Inputs);
+  assert.equal(chunk5Inputs.reroll_from_chunk,"Auto","continuation does not restart Chunk 1");
+  project=state("complete",{start:5,end:5,physical_group:5},"fresh-chunk-5");
   flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
-  assert(buttons.every(name=>visible(flow,name)),"Chunk 2 opens the review screen");
-  assert.match(w(flow,"Review Ready").value,/Chunk 2/);
-  w(flow,"Use it and continue").callback();
-  const chunk3Inputs={reroll_from_chunk:"Auto",reroll_nonce:0};
-  prepareReviewQueueIntent(flow,chunk3Inputs);
-  assert.equal(chunk3Inputs.reroll_from_chunk,"Auto");
-  project=state("complete",{start:3,end:3,physical_group:3},"fresh-chunk-3");
-  flow.onExecuted();await new Promise(resolve=>setImmediate(resolve));
-  assert(visible(flow,"Try this chunk again"),"Chunk 3 completion remains reviewable");
+  assert(visible(flow,"Try this chunk again"),"Chunk 5 completion remains reviewable");
   assert(!visible(flow,"Use it and continue")&&!visible(flow,"Use it and finish the rest"));
   assert.match(w(flow,"Review Ready").value,/Saved sequence is complete/);
+
+  // Full mode also keeps Auto so the backend can reuse Chunks 1-3 and generate 4-5.
+  const fullExtend=makeNode();w(fullExtend,"chunks").value=5;
+  await load(fullExtend,state("complete",{start:3,end:3,physical_group:3},"full-old-3"));
+  w(fullExtend,"Run").callback("Generate Full Video");
+  const fullInputs={reroll_from_chunk:"Auto",reroll_nonce:0};prepareReviewQueueIntent(fullExtend,fullInputs);
+  assert.equal(fullInputs.generation_mode,"Full Run");
+  assert.equal(fullInputs.reroll_from_chunk,"Auto");
+
+  // Storage Off cannot submit a stale explicit regeneration boundary.
+  const storageOff=makeNode();
+  w(storageOff,"generation_mode").value="Full Run";
+  w(storageOff,"run_storage").value="Off";
+  w(storageOff,"reroll_from_chunk").value="Chunk 1";
+  w(storageOff,"reroll_nonce").value=7;
+  for(const widget of storageOff.widgets)widget.beforeQueued?.({isPartialExecution:false});
+  const offInputs=await serializedInputs(storageOff);
+  assert.equal(offInputs.reroll_from_chunk,"Auto");
+  assert.equal(offInputs.reroll_nonce,0);
+  assert.equal(w(storageOff,"reroll_from_chunk").value,"Auto","visible stale boundary is normalized");
+
+  // An explicit Advanced regeneration remains explicit while storage is enabled.
+  const explicit=makeNode();
+  w(explicit,"reroll_from_chunk").value="Chunk 1";
+  w(explicit,"reroll_from_chunk").callback?.("Chunk 1");
+  w(explicit,"Run").callback("Generate Full Video");
+  w(explicit,"Run").callback("Review Each Chunk");
+  for(const widget of explicit.widgets)widget.beforeQueued?.({isPartialExecution:false});
+  const explicitInputs=await serializedInputs(explicit);
+  assert.equal(explicitInputs.reroll_from_chunk,"Chunk 1","manual Advanced regeneration is preserved");
   // Hotfix: stale saved review cannot offer/submit Retry after settings edits.
   const edited=makeNode();w(edited,"chunks").value=4;
   const originalProject=state("review_ready",{start:2,end:2,physical_group:2},"edit-base");

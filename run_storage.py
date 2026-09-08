@@ -9,8 +9,8 @@ import marshal
 import os
 import re
 import shutil
-import socket
 import time
+import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -287,8 +287,7 @@ def _replace_json_atomically(temporary: Path, destination: Path) -> None:
             winerror = getattr(exc, "winerror", None)
             error_code = winerror if winerror is not None else exc.errno
             transient = (
-                os.name == "nt"
-                and error_code in _WINDOWS_REPLACE_RETRY_WINERRORS
+                error_code in _WINDOWS_REPLACE_RETRY_WINERRORS
                 and delay is not None
             )
             if transient:
@@ -1186,6 +1185,12 @@ class RunStorageController:
         self.selected_take_revision: dict[str, Any] | None = None
         self.pending_branch_cut: dict[str, Any] | None = None
         self.storage_revision_id_override = ""
+        # Lock-scoped metadata only. Never cache tensors or skip raw integrity checks.
+        self._manifest_snapshot = None
+        self._plan_import = None
+        self.io_metrics = {"manifest_scans": 0, "manifest_reads": 0,
+                           "raw_loads": 0, "raw_bytes": 0,
+                           "manifest_seconds": 0.0, "raw_seconds": 0.0}
 
     def set_prompt_graph(self, prompt: Any, unique_id: Any) -> None:
         self.prompt_graph = prompt if isinstance(prompt, dict) else None
@@ -1220,6 +1225,7 @@ class RunStorageController:
 
     def __enter__(self) -> "RunStorageController":
         self.lock.acquire()
+        self._manifest_snapshot = None
         self.context_token = _ACTIVE.set(self)
         return self
 
@@ -1235,6 +1241,8 @@ class RunStorageController:
             if self.context_token is not None:
                 _ACTIVE.reset(self.context_token)
                 self.context_token = None
+            self._manifest_snapshot = None
+            self._plan_import = None
             self.lock.release()
 
     def _manifest_path(self) -> Path:
@@ -1245,13 +1253,17 @@ class RunStorageController:
     def _write_manifest(self) -> None:
         if self.manifest is not None:
             _write_json(self._manifest_path(), self.manifest)
+            self._manifest_snapshot = None
 
     def _read_manifests(self) -> dict[str, dict[str, Any]]:
+        if self.context_token is not None and self._manifest_snapshot is not None:
+            return self._manifest_snapshot
+        started = time.perf_counter()
         manifests: dict[str, dict[str, Any]] = {}
-        if not self.revisions_root.exists():
-            return manifests
+        self.io_metrics["manifest_scans"] += 1
         for path in sorted(self.revisions_root.glob("*/manifest.json")):
             try:
+                self.io_metrics["manifest_reads"] += 1
                 value = _read_json(path)
                 _manifest_sampling_identity(value)
                 revision_id = str(value.get("revision_id", ""))
@@ -1260,6 +1272,9 @@ class RunStorageController:
                 manifests[revision_id] = value
             except Exception as exc:
                 self.notes.append(f"provenance manifest {path.parent.name} rejected: {exc}")
+        self.io_metrics["manifest_seconds"] += time.perf_counter() - started
+        if self.context_token is not None:
+            self._manifest_snapshot = manifests
         return manifests
 
     def _manifest_provenance_chain(
@@ -1309,8 +1324,8 @@ class RunStorageController:
                 group=group,
                 variation_nonce=variation_nonce,
                 created_utc=str(
-                    source_manifest.get("updated_utc")
-                    or source_manifest.get("created_utc")
+                    source_manifest.get("created_utc")
+                    or source_manifest.get("updated_utc")
                     or ""
                 ),
                 storage_revision_id=source_id,
@@ -1482,9 +1497,14 @@ class RunStorageController:
     def _load_entry(self, record: dict[str, Any], prompt: str) -> dict[str, Any]:
         source = str(record["storage_revision_id"])
         filename = str(record["filename"])
-        if Path(filename).name != filename:
+        if Path(filename).name != filename or any(c in filename for c in "/\\") or filename in {"", ".", ".."}:
             raise RunStorageError("stored chunk filename is invalid")
+        if source in {"", ".", ".."} or any(c in source for c in "/\\"):
+            raise RunStorageError("stored revision directory is invalid")
         path = self.revisions_root / source / "chunks" / filename
+        if not path.resolve().is_relative_to(self.revisions_root.resolve()):
+            raise RunStorageError("stored chunk escapes the Run Storage directory")
+        started = time.perf_counter()
         if path.stat().st_size != int(record["file_size"]):
             raise RunStorageError(f"stored chunk size mismatch: {filename}")
         expected_sha256 = str(record.get("file_sha256", ""))
@@ -1492,13 +1512,17 @@ class RunStorageController:
             raise RunStorageError(f"stored chunk SHA-256 is missing: {filename}")
         if _file_sha256(path) != expected_sha256:
             raise RunStorageError(f"stored chunk SHA-256 mismatch: {filename}")
+        self.io_metrics["raw_bytes"] += int(record["file_size"])
+        self.io_metrics["raw_loads"] += 1
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             if set(handle.keys()) != {"audio", "video"}:
                 raise RunStorageError(f"stored chunk tensors are invalid: {filename}")
             video, audio = handle.get_tensor("video"), handle.get_tensor("audio")
         entry = dict(record["entry"])
         entry.update(prompt=str(prompt), video=video, audio=audio, reused=False)
-        return validate_chunk_entry(entry)
+        result = validate_chunk_entry(entry)
+        self.io_metrics["raw_seconds"] += time.perf_counter() - started
+        return result
 
     def _valid_prefix(
         self,
@@ -1601,6 +1625,166 @@ class RunStorageController:
                 raise RunStorageError("provenance prefix prompt lineage is incompatible")
             entries.append(entry)
         return entries, records[:len(entries)]
+
+    def _compatible_plan_prefix(
+        self, manifest: dict[str, Any], current_contract: dict[str, Any],
+        *, stop_before: int = 0,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Certify a prefix for import, not for cross-lineage Take selection.
+
+        Original provenance is validated first. Every reused physical group must
+        retain its topology and actual producing per-chunk contract. New plans
+        get their own raw copies below; no foreign lineage is spliced into a DAG.
+        """
+        manifests = self._read_manifests()
+        source_contract = manifest.get("contract") or {}
+        _manifest_sampling_identity(manifest)
+        if _hash(source_contract.get("global")) != _hash(current_contract.get("global")):
+            return [], []
+        chain = self._manifest_provenance_chain(manifest, manifests)
+        records = list(manifest.get("chunks") or [])
+        allowed = {g.start: g for g in physical_groups(
+            chunks=int(current_contract["chunk_count"]),
+            terminal_merge_enabled=_terminal_merge_enabled(current_contract),
+        )}
+        accepted = []
+        requested_by_producer = {}
+        for revision in chain:
+            group = revision["group"]
+            expected = allowed.get(int(group["start"]))
+            if (expected is None or expected.as_metadata() != group
+                    or (stop_before > 0 and expected.end >= stop_before)):
+                break
+            group_records = records[expected.start - 1:expected.end]
+            if len(group_records) != expected.end - expected.start + 1:
+                break
+            compatible = True
+            for position, record in zip(range(expected.start - 1, expected.end), group_records):
+                producer = manifests.get(str(record.get("storage_revision_id", "")))
+                if producer is None:
+                    compatible = False
+                    break
+                producing = producer.get("contract") or {}
+                hashes = producing.get("chunk_contract_hashes") or []
+                # Accepted earlier Takes can come from several nonce branches.
+                # Compare each producing contract against the new plan while
+                # preserving that producer's verified variation, not the latest
+                # branch's nonce for the entire ancestry.
+                producer_id = str(record["storage_revision_id"])
+                if producer_id not in requested_by_producer:
+                    requested_by_producer[producer_id] = _apply_reroll_branch_contract(
+                        current_contract,
+                        boundary=int(producing.get("reroll_from_chunk", 0)),
+                        requested_nonce=int(producing.get("effective_reroll_nonce", 0)),
+                        effective_nonce=int(producing.get("effective_reroll_nonce", 0)),
+                    )["chunk_contract_hashes"]
+                requested_hashes = requested_by_producer[producer_id]
+                producer_records = producer.get("chunks") or []
+                if (position >= len(hashes) or position >= len(requested_hashes)
+                        or hashes[position] != requested_hashes[position]
+                        or position >= len(producer_records)
+                        or producer_records[position] != record):
+                    compatible = False
+                    break
+            if not compatible:
+                break
+            accepted.extend(group_records)
+        entries = []
+        # Only now load the certified prefix. A corrupt group never becomes reusable.
+        for position, record in enumerate(accepted):
+            item = self._load_entry(record, self.prompts[position])
+            if item["prompt_hash"] != current_contract["prompt_hashes"][position]:
+                raise RunStorageError("imported prefix prompt does not match its producing contract")
+            entries.append(item)
+        return entries, accepted
+
+    def _find_plan_import(
+        self, contract: dict[str, Any], *, stop_before: int = 0,
+    ) -> dict[str, Any] | None:
+        """Find a verified plan prefix, stopping before explicit regeneration."""
+        if stop_before == 1:
+            return None
+        manifests = self._read_manifests()
+        # A matching plan already owns its history. Do not reload an older plan
+        # merely because that older plan also supplies a compatible prefix.
+        if any((m.get("contract") or {}).get("nonce_lineage_sha256")
+               == contract.get("nonce_lineage_sha256") for m in manifests.values()):
+            return None
+        canonical_id = ""
+        try:
+            project = _read_json(self.run_root / "project.json")
+            canonical_id = str(project.get("canonical_storage_revision_id", ""))
+            selected = manifests.get(canonical_id) or {}
+            expected_chain = (selected.get("branch_provenance") or {}).get("active_chain")
+            if expected_chain is not None and project.get("canonical_chain") != expected_chain:
+                canonical_id = ""
+        except (OSError, ValueError, RunStorageError):
+            pass
+        ordered = sorted(manifests.values(), key=lambda m: (
+            str(m.get("revision_id", "")) == canonical_id,
+            int((m.get("branch_provenance") or {}).get("canonical_sequence", 0)),
+            str(m.get("updated_utc", "")), str(m.get("revision_id", "")),
+        ), reverse=True)
+        for manifest in ordered:
+            source = manifest.get("contract") or {}
+            if (manifest.get("status") not in {"complete", "review_ready", "interrupted"}
+                    or source.get("nonce_lineage_sha256") == contract.get("nonce_lineage_sha256")
+                    or _hash(source.get("global")) != _hash(contract.get("global"))):
+                continue
+            # Preserve accepted variations when extending/editing a plan. Explicit
+            # regeneration still uses the existing nonce resolver, not this path.
+            boundary = int(source.get("reroll_from_chunk", 0))
+            nonce = int(source.get("effective_reroll_nonce", 0))
+            if boundary > int(contract["chunk_count"]):
+                boundary = nonce = 0
+            requested = _apply_reroll_branch_contract(
+                contract, boundary=boundary, requested_nonce=nonce, effective_nonce=nonce,
+            )
+            try:
+                entries, records = self._compatible_plan_prefix(
+                    manifest, requested, stop_before=stop_before,
+                )
+            except (RunStorageError, ValueError, OSError) as exc:
+                self.notes.append(f"plan prefix {manifest.get('revision_id', '')} rejected: {exc}")
+                continue
+            if not entries:
+                continue
+            if boundary > len(entries):
+                boundary = nonce = 0
+                requested = _apply_reroll_branch_contract(
+                    contract, boundary=0, requested_nonce=0, effective_nonce=0,
+                )
+            groups = physical_groups(chunks=int(contract["chunk_count"]),
+                                     terminal_merge_enabled=_terminal_merge_enabled(contract))
+            unit = next(g for g in groups if g.end == len(entries))
+            return {"revision_id": str(manifest["revision_id"]),
+                    "status": "complete" if len(entries) == int(contract["chunk_count"]) else "review_ready",
+                    "validated_prefix_count": len(entries), "review_unit": unit.as_metadata(),
+                    "branch_regenerate_from": boundary, "effective_reroll_nonce": nonce,
+                    "manifest": manifest, "entries": entries, "records": records,
+                    "contract": requested, "updated_utc": str(manifest.get("updated_utc", ""))}
+        return None
+
+    def _adopt_plan_prefix(self, imported: dict[str, Any]) -> list[dict[str, Any]]:
+        """Copy verified tensors into the new plan; keep every old revision intact."""
+        self.manifest["prefix_import"] = {
+            "version": 1, "source_revision_id": imported["revision_id"],
+            "source_contract_sha256": imported["manifest"]["contract_sha256"],
+            "records": [
+                {"sequence_index": position,
+                 "storage_revision_id": original["storage_revision_id"],
+                 "filename": original["filename"], "file_sha256": original["file_sha256"]}
+                for position, original in enumerate(imported["records"])
+            ],
+        }
+        self._write_manifest()
+        records = []
+        for position, entry in enumerate(imported["entries"]):
+            self.commit_chunk(entry, position=position)
+            records.append(dict(self.manifest["chunks"][-1]))
+        self.generated_count = 0  # Copies are reused work, never new Sampling.
+        self.notes.append(f"Imported {len(records)} verified prefix chunks into the new plan; originals preserved")
+        return records
 
     def _highest_lineage_nonce(self, lineage_sha256: str) -> int:
         highest = 0
@@ -1848,21 +2032,27 @@ class RunStorageController:
         if not self.revisions_root.exists():
             return None
         compatible_lineage = str(contract.get("nonce_lineage_sha256", ""))
-        heads: list[dict[str, Any]] = []
         mismatched_contracts: list[tuple[str, dict]] = []
-        paths = sorted(
-            self.revisions_root.glob("*/manifest.json"),
-            key=lambda path: path.parent.name,
-        )
-        for path in paths:
-            try:
-                manifest = _read_json(path)
-            except Exception as exc:
-                self.notes.append(f"review head {path.parent.name} rejected: {exc}")
-                continue
+        manifests = self._read_manifests()
+        canonical_id = ""
+        try:
+            project = _read_json(self.run_root / "project.json")
+            canonical_id = str(project.get("canonical_storage_revision_id", ""))
+            selected = manifests.get(canonical_id) or {}
+            expected_chain = (selected.get("branch_provenance") or {}).get("active_chain")
+            if expected_chain is not None and project.get("canonical_chain") != expected_chain:
+                canonical_id = ""
+        except (OSError, ValueError, RunStorageError):
+            pass
+        ordered = sorted(manifests.items(), key=lambda item: (
+            item[0] == canonical_id,
+            int((item[1].get("contract") or {}).get("effective_reroll_nonce", 0)),
+            str(item[1].get("updated_utc", "")), item[0],
+        ), reverse=True)
+        for revision_id, manifest in ordered:
             stored_contract = manifest.get("contract") or {}
             if str(stored_contract.get("nonce_lineage_sha256", "")) != compatible_lineage:
-                mismatched_contracts.append((path.parent.name, stored_contract))
+                mismatched_contracts.append((revision_id, stored_contract))
                 continue
             try:
                 head = self._validated_review_head(
@@ -1870,7 +2060,7 @@ class RunStorageController:
                     current_contract=contract,
                 )
             except Exception as exc:
-                self.notes.append(f"review head {path.parent.name} rejected: {exc}")
+                self.notes.append(f"review head {revision_id} rejected: {exc}")
                 continue
             if smart_regenerate_only and not (
                 head["status"] == REVISION_STATUS_REVIEW_READY
@@ -1880,52 +2070,24 @@ class RunStorageController:
                 )
             ):
                 continue
-            heads.append(head)
-        if not heads:
-            # Explain a missing head without changing which heads are reusable.
-            # Evaluate only after lookup fails; successful runs are unaffected.
-            candidates = []
-            for revision_id, stored_contract in mismatched_contracts:
-                try:
-                    delta = _review_contract_mismatches(stored_contract, contract)
-                    candidates.append((len(delta), revision_id, delta))
-                except Exception as exc:
-                    self.notes.append(
-                        f"review head {revision_id} diagnostic unavailable: {type(exc).__name__}"
-                    )
-            for _, revision_id, delta in sorted(candidates)[:3]:
-                detail = "; ".join(delta[:12]) or "lineage digest differs; inspect stored integrity"
-                if len(delta) > 12:
-                    detail += f"; {len(delta) - 12} more differing sections"
-                self.notes.append(f"review head {revision_id} incompatible: {detail}")
-            return None
-        _, catalog, chains = self._provenance_catalog(
-            lineage_sha256=compatible_lineage,
-        )
-        canonical_storage_revision_id, _ = self._canonical_project_selection(
-            catalog=catalog,
-            chains=chains,
-        )
-        if canonical_storage_revision_id:
-            for head in heads:
-                if head["revision_id"] == canonical_storage_revision_id:
-                    if smart_regenerate_only and not (
-                        head["status"] == REVISION_STATUS_REVIEW_READY
-                        or (
-                            head["status"] == REVISION_STATUS_COMPLETE
-                            and head["review_unit"] is not None
-                        )
-                    ):
-                        break
-                    return head
-        return max(
-            heads,
-            key=lambda head: (
-                int(head["effective_reroll_nonce"]),
-                str(head["updated_utc"]),
-                str(head["revision_id"]),
-            ),
-        )
+            return head
+        # Explain a missing head without changing which heads are reusable.
+        # Evaluate only after lookup fails; successful runs are unaffected.
+        candidates = []
+        for revision_id, stored_contract in mismatched_contracts:
+            try:
+                delta = _review_contract_mismatches(stored_contract, contract)
+                candidates.append((len(delta), revision_id, delta))
+            except Exception as exc:
+                self.notes.append(
+                    f"review head {revision_id} diagnostic unavailable: {type(exc).__name__}"
+                )
+        for _, revision_id, delta in sorted(candidates)[:3]:
+            detail = "; ".join(delta[:12]) or "lineage digest differs; inspect stored integrity"
+            if len(delta) > 12:
+                detail += f"; {len(delta) - 12} more differing sections"
+            self.notes.append(f"review head {revision_id} incompatible: {detail}")
+        return None
 
     def _resolve_review_contract(
         self,
@@ -1999,6 +2161,11 @@ class RunStorageController:
             contract,
             smart_regenerate_only=smart_only,
         )
+        if head is None and not smart_only and resume_safe:
+            self._plan_import = self._find_plan_import(
+                contract, stop_before=self.review_manual_regenerate_from,
+            )
+            head = self._plan_import
         self.review_head = head
         self.inherited_review_unit = (
             None if head is None or head.get("review_unit") is None
@@ -2063,6 +2230,70 @@ class RunStorageController:
         )
         self.review_execution = execution
         return resolved, effective_nonce, decision
+
+
+    def _reconcile_review_execution_with_reused_prefix(self, prefix_count: int) -> None:
+        """Make ordinary Review continuation follow the prefix actually reused.
+
+        Run Storage candidate selection is the final authority for which saved
+        prefix survived integrity/contract validation. A stale or missed review
+        head must never make the Review controller expect Chunk 1 while the
+        sampler has already restored Chunk 1 and is about to generate Chunk 2.
+        Explicit regeneration and Take actions keep their resolved boundaries.
+        """
+
+        execution = self.review_execution
+        if (
+            execution is None
+            or self.review_generation_mode != GENERATION_MODE_REVIEW
+            or self.review_action != REVIEW_ACTION_CONTINUE
+            or self.take_action != TAKE_ACTION_AUTOMATIC
+            or self.review_manual_regenerate_from
+        ):
+            return
+        contract = self.contract or {}
+        chunks = int(contract.get("chunk_count", 0))
+        prefix = int(prefix_count)
+        if chunks <= 0 or prefix < 0 or prefix > chunks:
+            raise RunStorageError("reused review prefix is outside the configured chunk range")
+        status = (
+            None
+            if prefix == 0
+            else REVISION_STATUS_COMPLETE
+            if prefix == chunks
+            else REVISION_STATUS_REVIEW_READY
+        )
+        terminal_merge_enabled = _terminal_merge_enabled(contract)
+        resolved = resolve_review_execution(
+            generation_mode=GENERATION_MODE_REVIEW,
+            review_action=REVIEW_ACTION_CONTINUE,
+            configured_chunks=chunks,
+            validated_prefix_count=prefix,
+            terminal_merge_enabled=terminal_merge_enabled,
+            terminal_pair_start=(chunks - 1 if terminal_merge_enabled else None),
+            manual_regenerate_from=0,
+            run_storage_mode=RUN_STORAGE_SAVE_AUTO_RESUME,
+            latest_review_unit=None,
+            latest_revision_status=status,
+            latest_effective_nonce=int(self.effective_reroll_nonce),
+            latest_branch_regenerate_from=int(contract.get("reroll_from_chunk", 0)),
+        )
+        old_expected = (
+            execution.next_review_unit_start,
+            execution.next_review_unit_end,
+            execution.next_review_physical_group,
+        )
+        new_expected = (
+            resolved.next_review_unit_start,
+            resolved.next_review_unit_end,
+            resolved.next_review_physical_group,
+        )
+        if old_expected != new_expected or execution.projected_prefix_count != resolved.projected_prefix_count:
+            self.notes.append(
+                "Review continuation reconciled to validated saved prefix "
+                f"{prefix}/{chunks}: expected {old_expected} -> {new_expected}."
+            )
+        self.review_execution = resolved
 
     def _resolve_effective_nonce(
         self, contract: dict[str, Any], *, requested_nonce: int, resume_safe: bool,
@@ -2167,13 +2398,20 @@ class RunStorageController:
                 resume_safe=safe,
             )
         else:
+            if safe:
+                self._plan_import = self._find_plan_import(
+                    contract, stop_before=int(reroll_from_chunk),
+                )
+            inherited_import = self._plan_import is not None and int(reroll_from_chunk) == 0
+            requested = (self._plan_import["effective_reroll_nonce"]
+                         if inherited_import else int(reroll_nonce))
+            if inherited_import:
+                contract = self._plan_import["contract"]
             effective_nonce, nonce_decision = self._resolve_effective_nonce(
-                contract, requested_nonce=int(reroll_nonce), resume_safe=safe
+                contract, requested_nonce=requested, resume_safe=safe,
             )
             contract = _apply_nonce_contract(
-                contract,
-                requested_nonce=int(reroll_nonce),
-                effective_nonce=effective_nonce,
+                contract, requested_nonce=requested, effective_nonce=effective_nonce,
             )
         self.resume_safe = bool(safe)
         self.effective_reroll_nonce = int(effective_nonce)
@@ -2185,6 +2423,14 @@ class RunStorageController:
             self.disabled_reasons = reasons
         self.contract = contract
         sampling_revision_id, self.contract_sha256 = revision_identity(contract)
+        # A selected, shorter canonical Take is not interchangeable with an old
+        # longer revision having the same sampling inputs. Continue in its own
+        # storage revision when the contract is unchanged; preserve old Takes.
+        head_manifest = (self.review_head or {}).get("manifest")
+        if (not self.storage_revision_id_override and self._plan_import is None
+                and isinstance(head_manifest, dict)
+                and head_manifest.get("contract_sha256") == self.contract_sha256):
+            self.storage_revision_id_override = str(head_manifest["revision_id"])
         self.revision_id = self.storage_revision_id_override or _storage_revision_identity(
             contract_sha256=self.contract_sha256,
             take_action=TAKE_ACTION_AUTOMATIC,
@@ -2207,18 +2453,26 @@ class RunStorageController:
         hashes = list(contract["chunk_contract_hashes"])
         best_entries: list[dict[str, Any]] = []
         best_records: list[dict[str, Any]] = []
-        if self.selected_take_revision is not None:
+        if exact is not None:
+            self._plan_import = None
+        if self._plan_import is not None:
+            best_entries = list(self._plan_import["entries"])
+            best_records = []  # Populated with new-plan-owned copies after manifest creation.
+        elif self.selected_take_revision is not None:
             best_entries = list(self.selected_take_revision["entries"])
             best_records = list(self.selected_take_records)
         else:
             candidates = [exact] if exact is not None and safe else []
             if safe and exact is None and self.revisions_root.exists():
-                for path in self.revisions_root.glob("*/manifest.json"):
-                    try:
-                        candidates.append(_read_json(path))
-                    except Exception:
-                        continue
+                if isinstance(head_manifest, dict):
+                    candidates.append(head_manifest)
+                else:
+                    candidates.extend(self._read_manifests().values())
+            candidates.sort(key=lambda m: (len(m.get("chunks") or []),
+                int((m.get("branch_provenance") or {}).get("canonical_sequence", 0))), reverse=True)
             for candidate in candidates:
+                if len(candidate.get("chunks") or []) <= len(best_entries):
+                    continue
                 if int(candidate.get("run_storage_schema_version", -1)) not in RUN_STORAGE_READABLE_SCHEMA_VERSIONS:
                     continue
                 if (
@@ -2242,6 +2496,7 @@ class RunStorageController:
                 if len(entries) > len(best_entries):
                     best_entries, best_records = entries, records
 
+        self._reconcile_review_execution_with_reused_prefix(len(best_entries))
         self.reused_count = len(best_entries)
         now = _now()
         self.manifest = {
@@ -2261,6 +2516,8 @@ class RunStorageController:
             "chunks": best_records,
             "report_summary": (exact or {}).get("report_summary", ""),
         }
+        if exact is not None and isinstance(exact.get("prefix_import"), dict):
+            self.manifest["prefix_import"] = dict(exact["prefix_import"])
         if self.selected_take_chain:
             self.manifest["branch_provenance"] = {
                 "version": BRANCH_PROVENANCE_VERSION,
@@ -2281,6 +2538,9 @@ class RunStorageController:
                 effective_reroll_nonce=int(effective_nonce),
             )
         self._write_manifest()
+        if self._plan_import is not None:
+            best_records = self._adopt_plan_prefix(self._plan_import)
+            self._plan_import = None
         self._write_project()
         if not best_entries:
             return None
@@ -2406,7 +2666,10 @@ class RunStorageController:
         total = int((self.contract or {}).get("chunk_count", 0))
         resume = self.reused_count + 1 if self.reused_count < total else "complete"
         policy = (" auto-resume disabled: " + "; ".join(self.disabled_reasons) + ".") if self.disabled_reasons else ""
-        note = (" " + " ".join(self.notes)) if self.notes else ""
+        shown_notes = self.notes if detailed else list(dict.fromkeys(self.notes))[:3]
+        note = (" " + " ".join(shown_notes)) if shown_notes else ""
+        if not detailed and len(self.notes) > len(shown_notes):
+            note += f" ({len(self.notes) - len(shown_notes)} additional diagnostics; enable Detailed Report.)"
         basic = (
             f"Run Storage: {self.run_name} / revision {self.revision_id}; "
             f"{self.reused_count} reused, {self.generated_count} generated, "
@@ -2416,7 +2679,8 @@ class RunStorageController:
         if not detailed or self.manifest is None:
             return basic
         records = list(self.manifest.get("chunks") or [])
-        lines = [basic, f"Run Storage path: {self.revision_root}"]
+        lines = [basic, f"Run Storage path: {self.revision_root}",
+                 "Run Storage I/O: " + _canonical(self.io_metrics)]
         for record in records:
             lines.append(
                 f"stored chunk {int(record['sequence_index']) + 1}: "
